@@ -1,0 +1,11 @@
+[Unit]
+Description=Monstra.Pro Box update check (one-shot, triggered by monstrapro-updater.timer)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=monstrapro
+WorkingDirectory=/opt/monstrapro/current
+ExecStart=/opt/monstrapro/current/services/updater/.venv/bin/python -m updater.main
+EnvironmentFile=-/etc/monstrapro/env

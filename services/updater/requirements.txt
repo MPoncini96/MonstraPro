@@ -1,0 +1,2 @@
+-e ../../packages/device_core
+requests
