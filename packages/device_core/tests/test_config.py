@@ -1,47 +1,79 @@
-from device_core.config import load_config
+import pytest
+
+from device_core.config import ConfigError, load_config
 
 
-def test_defaults_create_data_dir(tmp_path, monkeypatch):
-    monkeypatch.delenv("MONSTRA_PRO_BASE_URL", raising=False)
-    monkeypatch.delenv("MONSTRAPRO_LOG_LEVEL", raising=False)
-    monkeypatch.delenv("MONSTRAPRO_CONFIG_FILE", raising=False)
+def test_defaults_create_data_dir_and_release_dir(tmp_path):
     data_dir = tmp_path / "data"
 
     config = load_config(overrides={"data_dir": str(data_dir)})
 
     assert config.data_dir == data_dir.resolve()
     assert config.data_dir.exists()
-    assert config.db_path == config.data_dir / "monstrapro.db"
-    assert config.device_key_path == config.data_dir / "device.key"
-    assert config.monstra_pro_base_url == "https://monstra.pro"
+    assert config.release_dir == config.data_dir / "releases"
+    assert config.release_dir.exists()
+    assert config.encryption_key_path == config.data_dir / "device.key"
+    assert config.sqlite_url == f"sqlite:///{(config.data_dir / 'monstrapro.db').as_posix()}"
+    assert config.monstra_pro_api_url == "https://monstra.pro"
     assert config.log_level == "INFO"
+    assert config.event_poll_interval_seconds == 30
 
 
-def test_env_overrides(tmp_path, monkeypatch):
-    monkeypatch.delenv("MONSTRAPRO_CONFIG_FILE", raising=False)
-    monkeypatch.setenv("MONSTRA_PRO_BASE_URL", "https://dev.monstra.pro")
+def test_env_overrides_win_over_defaults(tmp_path, monkeypatch):
+    monkeypatch.setenv("MONSTRA_PRO_API_URL", "https://dev.monstra.pro")
     monkeypatch.setenv("MONSTRAPRO_LOG_LEVEL", "debug")
-    monkeypatch.setenv("MONSTRAPRO_POLL_INTERVAL_SECONDS", "5")
+    monkeypatch.setenv("MONSTRAPRO_EVENT_POLL_INTERVAL_SECONDS", "5")
 
-    config = load_config(overrides={"data_dir": str(tmp_path / "data2")})
+    config = load_config(overrides={"data_dir": str(tmp_path / "data")})
 
-    assert config.monstra_pro_base_url == "https://dev.monstra.pro"
+    assert config.monstra_pro_api_url == "https://dev.monstra.pro"
     assert config.log_level == "DEBUG"
-    assert config.poll_interval_seconds == 5
+    assert config.event_poll_interval_seconds == 5
 
 
-def test_toml_layer_overridden_by_env(tmp_path, monkeypatch):
+def test_toml_layer_is_overridden_by_env(tmp_path, monkeypatch):
     toml_path = tmp_path / "config.toml"
-    toml_path.write_text('monstra_pro_base_url = "https://toml.example"\nlog_level = "warning"\n')
+    toml_path.write_text('monstra_pro_api_url = "https://toml.example"\nlog_level = "warning"\n')
     monkeypatch.setenv("MONSTRAPRO_CONFIG_FILE", str(toml_path))
-    monkeypatch.delenv("MONSTRA_PRO_BASE_URL", raising=False)
-    monkeypatch.delenv("MONSTRAPRO_LOG_LEVEL", raising=False)
 
-    config = load_config(overrides={"data_dir": str(tmp_path / "data3")})
-    assert config.monstra_pro_base_url == "https://toml.example"
+    config = load_config(overrides={"data_dir": str(tmp_path / "data")})
+    assert config.monstra_pro_api_url == "https://toml.example"
     assert config.log_level == "WARNING"
 
-    # env still wins over the toml file when both are set
-    monkeypatch.setenv("MONSTRA_PRO_BASE_URL", "https://env-wins.example")
-    config = load_config(overrides={"data_dir": str(tmp_path / "data4")})
-    assert config.monstra_pro_base_url == "https://env-wins.example"
+    monkeypatch.setenv("MONSTRA_PRO_API_URL", "https://env-wins.example")
+    config = load_config(overrides={"data_dir": str(tmp_path / "data2")})
+    assert config.monstra_pro_api_url == "https://env-wins.example"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"log_level": "not-a-level"},
+        {"monstra_pro_api_url": "not-a-url"},
+        {"sqlite_url": "postgresql:///nope"},
+        {"event_poll_interval_seconds": 0},
+        {"event_poll_interval_seconds": -5},
+    ],
+)
+def test_invalid_values_raise_config_error(tmp_path, overrides):
+    overrides = {"data_dir": str(tmp_path / "data"), **overrides}
+    with pytest.raises(ConfigError):
+        load_config(overrides=overrides)
+
+
+def test_toml_file_with_alpaca_key_is_rejected(tmp_path, monkeypatch):
+    toml_path = tmp_path / "config.toml"
+    toml_path.write_text('alpaca_api_key = "should-never-be-here"\n')
+    monkeypatch.setenv("MONSTRAPRO_CONFIG_FILE", str(toml_path))
+
+    with pytest.raises(ConfigError, match="alpaca_api_key"):
+        load_config(overrides={"data_dir": str(tmp_path / "data")})
+
+
+def test_toml_file_with_credential_key_is_rejected(tmp_path, monkeypatch):
+    toml_path = tmp_path / "config.toml"
+    toml_path.write_text('some_credential = "nope"\n')
+    monkeypatch.setenv("MONSTRAPRO_CONFIG_FILE", str(toml_path))
+
+    with pytest.raises(ConfigError, match="some_credential"):
+        load_config(overrides={"data_dir": str(tmp_path / "data")})
