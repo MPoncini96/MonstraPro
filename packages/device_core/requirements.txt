@@ -1,3 +1,2 @@
-sqlalchemy
-alembic
-cryptography
+sqlalchemy>=2.0
+cryptography>=42
