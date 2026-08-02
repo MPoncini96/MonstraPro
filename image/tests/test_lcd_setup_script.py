@@ -36,7 +36,7 @@ def test_rotation_is_validated_against_known_values(scripts_dir):
 def test_idempotent_via_marker_files_written_before_the_rebooting_step(scripts_dir):
     text = _text(scripts_dir)
     assert ".lcd-driver-installed" in text
-    assert ".lcd-rotation-$ROTATION" in text
+    assert ".lcd-rotation-current" in text
     # The marker write must precede the command that might reboot the box,
     # not follow it - otherwise a reboot mid-step means the marker is never
     # written and the step re-runs forever on every future boot.
@@ -46,9 +46,22 @@ def test_idempotent_via_marker_files_written_before_the_rebooting_step(scripts_d
     mhs35_index = text.index("run ./MHS35-show")
     assert driver_marker_index < mhs35_index
 
-    rotation_marker_index = text.index("touch \"$ROTATION_MARKER\"")
+    rotation_write_index = text.index("CURRENT_ROTATION_FILE\"")
     rotate_index = text.index("run ./rotate.sh")
-    assert rotation_marker_index < rotate_index
+    assert rotation_write_index < rotate_index
+
+
+def test_rotation_state_is_a_single_current_value_not_one_marker_per_value(scripts_dir):
+    """Regression guard for a real bug found switching a real Pi's rotation
+    back and forth during hardware bring-up: a marker file per rotation
+    value (e.g. ".lcd-rotation-180") never gets cleaned up, so switching
+    180 -> 0 -> 180 again silently no-ops on the second 180 because that
+    stale marker is still there. A single "currently applied" value,
+    compared against the requested one, is the correct design - it must
+    re-run rotate.sh whenever they differ, regardless of history."""
+    text = _text(scripts_dir)
+    assert 'CURRENT_ROTATION="$(cat "$CURRENT_ROTATION_FILE")"' in text
+    assert 'if [ "$CURRENT_ROTATION" = "$ROTATION" ]' in text
 
 
 def test_skips_reinstall_when_driver_marker_present(scripts_dir):
@@ -57,9 +70,9 @@ def test_skips_reinstall_when_driver_marker_present(scripts_dir):
     assert "skipping MHS35-show" in text
 
 
-def test_skips_reapplying_rotation_when_marker_present(scripts_dir):
+def test_skips_reapplying_rotation_when_already_current(scripts_dir):
     text = _text(scripts_dir)
-    assert 'if [ -f "$ROTATION_MARKER" ]' in text
+    assert 'if [ "$CURRENT_ROTATION" = "$ROTATION" ]' in text
     assert "skipping rotate.sh" in text
 
 

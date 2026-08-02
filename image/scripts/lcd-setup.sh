@@ -61,11 +61,16 @@ case " $VALID_ROTATIONS " in
         ;;
 esac
 
-# Rotation is folded into the marker's filename, not a single fixed marker -
-# switching the configured rotation later (e.g. a support call after the
-# enclosure design changes) re-runs only rotate.sh, not the whole driver
-# install, and switching back doesn't lose the earlier marker either.
-ROTATION_MARKER="$STATE_DIR/.lcd-rotation-$ROTATION"
+# A single "what's currently applied" file, not one marker per rotation
+# value ever requested - switching the configured rotation later (e.g. a
+# support call after the enclosure design changes) must re-run rotate.sh
+# whenever the requested value DIFFERS from what's currently applied, even
+# if that value was applied once before and then changed away from. A
+# per-value marker (e.g. ".lcd-rotation-180") gets this wrong: switching
+# 180 -> 0 -> 180 again would silently no-op on the second 180, since that
+# marker was never cleaned up - caught live switching a real Pi's rotation
+# back and forth during hardware bring-up.
+CURRENT_ROTATION_FILE="$STATE_DIR/.lcd-rotation-current"
 
 run() {
     if [ "$DRY_RUN" = "1" ]; then
@@ -117,11 +122,19 @@ else
     # monstrapro-lcd-setup.service and finds $DRIVER_MARKER already present.
 fi
 
-# --- apply the enclosure's rotation, exactly once per rotation value ---------
-if [ -f "$ROTATION_MARKER" ]; then
-    echo "Rotation $ROTATION already applied (marker present) - skipping rotate.sh"
+# --- apply the enclosure's rotation, only when it actually needs to change ---
+CURRENT_ROTATION=""
+if [ -f "$CURRENT_ROTATION_FILE" ]; then
+    CURRENT_ROTATION="$(cat "$CURRENT_ROTATION_FILE")"
+fi
+
+if [ "$CURRENT_ROTATION" = "$ROTATION" ]; then
+    echo "Rotation $ROTATION already applied (recorded as current) - skipping rotate.sh"
 else
-    run touch "$ROTATION_MARKER"
+    # Written before rotate.sh runs, same reasoning as $DRIVER_MARKER above -
+    # if the box reboots mid-command, the next boot sees this value already
+    # recorded and won't re-run rotate.sh redundantly.
+    run bash -c "printf '%s' '$ROTATION' > '$CURRENT_ROTATION_FILE'"
     (
         cd "$VENDOR_DIR"
         run ./rotate.sh "$ROTATION"
