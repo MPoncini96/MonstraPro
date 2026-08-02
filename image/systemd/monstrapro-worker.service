@@ -1,8 +1,11 @@
 [Unit]
 Description=Monstra.Pro Box trading worker
+# No Requisite=monstrapro-firstboot.service - see monstrapro-display.service's
+# comment for why that breaks on every boot after the first (firstboot's
+# ConditionPathExists guard means it's skipped, not "active", once its
+# marker file exists). After= alone is correct here.
 After=network-online.target monstrapro-firstboot.service monstrapro-lcd-setup.service
 Wants=network-online.target
-Requisite=monstrapro-firstboot.service
 
 [Service]
 Type=simple

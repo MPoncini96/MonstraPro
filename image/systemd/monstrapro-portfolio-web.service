@@ -4,9 +4,13 @@ Description=Monstra.Pro Box portfolio web (always-on local portfolio editing pag
 # network at all), this page is only useful once the device is actually
 # reachable on the home network - After=network-online.target is correct
 # here, not a mistake copied from the wrong unit.
+#
+# No Requisite=monstrapro-firstboot.service - see monstrapro-display.service's
+# comment for why that breaks on every boot after the first (firstboot's
+# ConditionPathExists guard means it's skipped, not "active", once its
+# marker file exists). After= alone is correct here.
 After=network-online.target monstrapro-firstboot.service
 Wants=network-online.target
-Requisite=monstrapro-firstboot.service
 
 [Service]
 Type=simple

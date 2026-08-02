@@ -133,11 +133,36 @@ def test_lcd_setup_runs_as_root_once_before_the_other_services(systemd_dir, pars
 
 def test_lcd_setup_is_ordered_but_not_required_by_the_other_services(systemd_dir, parse_unit_file):
     """LCD-setup failing shouldn't block trading/agent/display from starting
-    - it's a display-config nicety, not a correctness requirement, unlike
-    monstrapro-firstboot.service's Requisite= (which IS required)."""
+    - it's a display-config nicety, not a correctness requirement."""
     for name in ("monstrapro-agent.service", "monstrapro-display.service", "monstrapro-worker.service"):
         unit = parse_unit_file(systemd_dir / name)
         after = " ".join(unit["Unit"].get("After", []))
         assert "monstrapro-lcd-setup.service" in after
         requisite = " ".join(unit["Unit"].get("Requisite", []))
         assert "monstrapro-lcd-setup.service" not in requisite
+
+
+def test_no_unit_requires_firstboot_to_stay_active(systemd_dir, parse_unit_file):
+    """Regression guard for a real bug found on physical Pi 5 hardware:
+    monstrapro-firstboot.service is ConditionPathExists-guarded to do real
+    work only once, so on every later boot systemd *skips* it rather than
+    marking it active. Requisite= requires the target to be genuinely
+    active, so `Requisite=monstrapro-firstboot.service` on any dependent
+    unit silently blocks that unit from ever starting again after the
+    first boot - confirmed live: `systemctl status` showed
+    monstrapro-display.service as enabled+inactive with zero log entries,
+    i.e. it never even attempted to start. After= (ordering only, doesn't
+    require "active") is the correct dependency instead - every affected
+    unit already has it and none should reintroduce Requisite= here."""
+    for name in (
+        "monstrapro-lcd-setup.service",
+        "monstrapro-agent.service",
+        "monstrapro-display.service",
+        "monstrapro-worker.service",
+        "monstrapro-portfolio-web.service",
+    ):
+        unit = parse_unit_file(systemd_dir / name)
+        requisite = " ".join(unit["Unit"].get("Requisite", []))
+        assert "monstrapro-firstboot.service" not in requisite, f"{name} must not Requisite= firstboot"
+        after = " ".join(unit["Unit"].get("After", []))
+        assert "monstrapro-firstboot.service" in after, f"{name} should still order After= firstboot"

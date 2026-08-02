@@ -8,8 +8,16 @@ Description=Monstra.Pro Box status display
 # required) after monstrapro-lcd-setup.service so a steady-state boot
 # renders straight to the already-configured LCD; if LCD setup ever fails,
 # display still starts rather than being blocked by a display-config nicety.
+#
+# No Requisite=monstrapro-firstboot.service here (deliberately removed) -
+# firstboot's ConditionPathExists guard means it's *skipped*, not
+# "active", on every boot after the first. Requisite= requires the target
+# to be genuinely active, so it would silently block this unit from ever
+# starting again after the first boot - After= alone (ordering only, not
+# an activeness requirement) is the correct dependency. Caught live on
+# real Pi 5 hardware: `systemctl status` showed enabled+inactive with zero
+# log entries, i.e. never even attempted to start.
 After=local-fs.target monstrapro-firstboot.service monstrapro-lcd-setup.service
-Requisite=monstrapro-firstboot.service
 
 [Service]
 Type=simple

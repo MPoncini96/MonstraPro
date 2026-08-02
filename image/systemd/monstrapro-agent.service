@@ -5,9 +5,12 @@ Description=Monstra.Pro Box device agent (first-boot Wi-Fi onboarding)
 # *establish* connectivity when none exists yet, so ordering after "the
 # network is online" would be a deadlock on a genuine first boot. See
 # image/README.md "Boot order" for the full reasoning.
+# No Requisite=monstrapro-firstboot.service - see monstrapro-display.service's
+# comment for why that breaks on every boot after the first (firstboot's
+# ConditionPathExists guard means it's skipped, not "active", once its
+# marker file exists). After= alone is correct here.
 After=local-fs.target monstrapro-firstboot.service monstrapro-lcd-setup.service NetworkManager.service
 Wants=NetworkManager.service
-Requisite=monstrapro-firstboot.service
 
 [Service]
 Type=simple

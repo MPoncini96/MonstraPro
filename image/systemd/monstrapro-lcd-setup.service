@@ -1,8 +1,15 @@
 [Unit]
 Description=Monstra.Pro Box 3.5in LCD driver setup (idempotent, may reboot on first run)
+# No Requisite=monstrapro-firstboot.service - see monstrapro-display.service's
+# comment for why that breaks on every boot after the first (firstboot's
+# ConditionPathExists guard means it's skipped, not "active", once its
+# marker file exists). After= alone is correct here. (Harmless in practice
+# for this specific unit - the LCD's kernel-level config from the first
+# real run persists in /boot/firmware/config.txt regardless - but fixed
+# for consistency and because a future change here shouldn't silently
+# inherit the same trap.)
 After=local-fs.target monstrapro-firstboot.service
 Before=monstrapro-display.service monstrapro-agent.service monstrapro-worker.service
-Requisite=monstrapro-firstboot.service
 
 [Service]
 # Runs as root, like monstrapro-firstboot.service - installing a kernel
