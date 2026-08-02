@@ -77,7 +77,15 @@ for service_dir in "$RELEASE_ROOT"/services/*/; do
         echo "creating venv for $service_name"
         run python3 -m venv "$service_dir/.venv"
         run "$service_dir/.venv/bin/pip" install --quiet --upgrade pip
-        run "$service_dir/.venv/bin/pip" install --quiet -r "$service_dir/requirements.txt"
+        # Run from inside service_dir, in a subshell so the cd doesn't leak
+        # to the rest of the script - each requirements.txt's `-e
+        # ../../packages/...` lines are written relative to the service
+        # directory (matching every service's own documented local dev
+        # workflow: `cd services/X && pip install -r requirements-dev.txt`),
+        # not relative to wherever install.sh itself was invoked from. pip
+        # resolves editable paths against its own CWD, not the requirements
+        # file's location, so without this cd those lines fail to resolve.
+        ( cd "$service_dir" && run .venv/bin/pip install --quiet -r requirements.txt )
     fi
 done
 
