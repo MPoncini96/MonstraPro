@@ -1,0 +1,41 @@
+Final Product: A rapsberry 5 2gb that only runs MonstraPro. This device will be called the MonstraPro Box
+
+The MonstraPro Box is accessible via website:  Monstra.pro
+
+
+User creates an account on Monstra.pro.  This site is where they can interact with the MonstraPro Box
+
+
+User sends data from Monstra.pro to their MonstraProBox, including alpaca key and secret and Account settings.
+
+
+
+On monstra.pro, the user will be able to select up to 10 algorithms.  They can only choose official Monstra bots (from monstra.bot).
+
+All bots are displayed, and their selected bots are on display at the top.  When a user clicks more details for a bot, a new tab opens with more info on a bot
+
+When a user is finished selecting bots, they press a preview bot portfolio.
+
+
+Preview bot portfolio displays the current stocks and quantities that the portfolio will hold.  It also shows user how diverse their portfolio is, how many sectors are being represented.  It tells them how aggressive / safe their portfolio is.  
+
+
+Users can go back and edit, or submit.  They can go back to this site to edit their bot portfolios any time.  
+
+
+The MonstraPro Box sees how much money is in users Alpaca Account (can be live or paper).  
+
+It then uses the bot algorithms, locally, that make trades on the alpaca accounts.  
+
+It tracks the trades and performances locally on a sql database
+
+
+The MonstraPro box has a screen.  The screen will always display bot performances, portfolio performances, recent trades (closed positions, display win or loss), new trades, and current actions.  
+
+
+During off hours, around an hour before market opens, the MonstraProBox will receive updates from Monstra.Pro.  This will mainly includes algorithm universe updates.  It will also include notifications, such as, new bots, or update required on Monstra.Pro.  These will be banners that will be fed into the display loop.
+
+
+
+
+

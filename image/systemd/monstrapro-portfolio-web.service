@@ -1,0 +1,28 @@
+[Unit]
+Description=Monstra.Pro Box portfolio web (always-on local portfolio editing page)
+# Unlike monstrapro-agent.service (which must run before there's any
+# network at all), this page is only useful once the device is actually
+# reachable on the home network - After=network-online.target is correct
+# here, not a mistake copied from the wrong unit.
+After=network-online.target monstrapro-firstboot.service
+Wants=network-online.target
+Requisite=monstrapro-firstboot.service
+
+[Service]
+Type=simple
+User=monstrapro
+Group=monstrapro
+WorkingDirectory=/opt/monstrapro/current
+ExecStart=/opt/monstrapro/current/services/portfolio_web/.venv/bin/python -m portfolio_web.main
+Restart=on-failure
+RestartSec=5
+EnvironmentFile=-/etc/monstrapro/env
+# Non-root `monstrapro` still needs to bind the page on port 80 for
+# http://monstrapro.local - same mechanism monstrapro-agent.service uses
+# for its own (temporary) setup page.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

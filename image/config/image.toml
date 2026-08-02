@@ -1,0 +1,68 @@
+# Declarative description of the target Raspberry Pi image. This is a
+# documentation/spec artifact for a future image-build tool (e.g. a pi-gen
+# custom stage, or rpi-image-gen) - nothing in this repo parses or executes
+# it yet. Building a real image is explicitly out of scope for this pass;
+# see image/README.md "What remains before flashing a real image".
+
+[base]
+distro = "Raspberry Pi OS Lite (64-bit)"
+target_hardware = "Raspberry Pi 5 (2GB/4GB)"
+hostname = "monstrapro"
+timezone = "Etc/UTC"
+
+[boot]
+# Boots to a text console, no desktop environment, no login prompt -
+# `display` (services/display) is the only thing on screen.
+desktop_environment = false
+autologin = false
+splash_screen = false
+
+[packages]
+apt = [
+    "python3",
+    "python3-venv",
+    "network-manager",
+    "libsdl2-2.0-0",     # pygame-ce's KMSDRM backend
+    "libsdl2-ttf-2.0-0",
+    "git",               # image/scripts/lcd-setup.sh clones goodtft/LCD-show
+]
+
+[display]
+# goodtft/LCD-show's MHS35 driver for the attached 3.5in LCD - see
+# image/scripts/lcd-setup.sh and image/README.md "LCD display setup".
+panel = "MHS35"
+rotation_degrees = 180  # this enclosure's requirement; override via
+                         # MONSTRAPRO_LCD_ROTATION in /etc/monstrapro/env
+vendor_repo = "https://github.com/goodtft/LCD-show.git"
+hdmi_required_after_setup = false
+
+[portfolio_web]
+# Always-on local page for editing bots and locked stock holdings - see
+# services/portfolio_web and image/README.md "Local portfolio editing".
+port = 80
+hostname = "monstrapro.local"  # mDNS/Avahi, already advertised by stock Raspberry Pi OS
+pin_gated = true               # PIN shown on the device's own LCD - see services/display
+
+[users]
+[users.monstrapro]
+system_account = true
+login_shell = "/usr/sbin/nologin"
+groups = ["netdev"]
+home = "/var/lib/monstrapro"
+description = "Runs the five Monstra.Pro Box services (display, device_agent, trading_worker, portfolio_web, updater) - see image/README.md."
+
+[directories]
+"/opt/monstrapro" = { owner = "monstrapro", mode = "0755" }
+"/var/lib/monstrapro" = { owner = "monstrapro", mode = "0750" }
+"/etc/monstrapro" = { owner = "root", mode = "0755" }
+
+[services]
+enabled = [
+    "monstrapro-firstboot.service",
+    "monstrapro-lcd-setup.service",
+    "monstrapro-agent.service",
+    "monstrapro-display.service",
+    "monstrapro-worker.service",
+    "monstrapro-portfolio-web.service",
+    "monstrapro-updater.timer",
+]

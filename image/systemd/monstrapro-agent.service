@@ -1,0 +1,31 @@
+[Unit]
+Description=Monstra.Pro Box device agent (first-boot Wi-Fi onboarding)
+# After NetworkManager.service (the daemon must be running so nmcli/D-Bus
+# calls work), NOT network-online.target - this unit's whole job is to
+# *establish* connectivity when none exists yet, so ordering after "the
+# network is online" would be a deadlock on a genuine first boot. See
+# image/README.md "Boot order" for the full reasoning.
+After=local-fs.target monstrapro-firstboot.service monstrapro-lcd-setup.service NetworkManager.service
+Wants=NetworkManager.service
+Requisite=monstrapro-firstboot.service
+
+[Service]
+Type=simple
+User=monstrapro
+Group=monstrapro
+WorkingDirectory=/opt/monstrapro/current
+ExecStart=/opt/monstrapro/current/services/device_agent/.venv/bin/python -m device_agent.main
+Restart=on-failure
+RestartSec=5
+EnvironmentFile=-/etc/monstrapro/env
+# Non-root `monstrapro` still needs to: (1) manage NetworkManager
+# connections (create/join/save Wi-Fi) and (2) bind the setup page on port
+# 80 for http://setup.monstra. Ambient capabilities grant exactly those two
+# privileges without full root - see image/README.md "What remains" for the
+# NetworkManager polkit rule this still needs on the base image.
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

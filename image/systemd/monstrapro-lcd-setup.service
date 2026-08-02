@@ -1,0 +1,20 @@
+[Unit]
+Description=Monstra.Pro Box 3.5in LCD driver setup (idempotent, may reboot on first run)
+After=local-fs.target monstrapro-firstboot.service
+Before=monstrapro-display.service monstrapro-agent.service monstrapro-worker.service
+Requisite=monstrapro-firstboot.service
+
+[Service]
+# Runs as root, like monstrapro-firstboot.service - installing a kernel
+# devicetree overlay (goodtft/LCD-show's MHS35-show) requires it. A
+# steady-state (already-configured) run is a fast no-op via marker files -
+# see image/scripts/lcd-setup.sh and image/README.md "LCD display setup"
+# for why the very first run may trigger a Pi reboot, and why that's
+# expected rather than a failure.
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/monstrapro/current/image/scripts/lcd-setup.sh
+EnvironmentFile=-/etc/monstrapro/env
+
+[Install]
+WantedBy=multi-user.target

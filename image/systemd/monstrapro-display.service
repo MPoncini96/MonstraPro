@@ -1,0 +1,27 @@
+[Unit]
+Description=Monstra.Pro Box status display
+# Deliberately does NOT wait on network-online.target or any Wi-Fi/agent
+# unit - Objectives.txt requires the display to start immediately while
+# networking and other services initialize. monstrapro-firstboot.service
+# only does local filesystem/ownership setup, so it adds effectively no
+# delay - see image/README.md "First-boot state flow". Ordered (not
+# required) after monstrapro-lcd-setup.service so a steady-state boot
+# renders straight to the already-configured LCD; if LCD setup ever fails,
+# display still starts rather than being blocked by a display-config nicety.
+After=local-fs.target monstrapro-firstboot.service monstrapro-lcd-setup.service
+Requisite=monstrapro-firstboot.service
+
+[Service]
+Type=simple
+User=monstrapro
+Group=monstrapro
+WorkingDirectory=/opt/monstrapro/current
+ExecStart=/opt/monstrapro/current/services/display/.venv/bin/python -m display.main
+Restart=on-failure
+RestartSec=5
+EnvironmentFile=-/etc/monstrapro/env
+NoNewPrivileges=true
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

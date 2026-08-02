@@ -41,3 +41,38 @@ def test_record_software_version(config):
     updated = repo.record_software_version("0.1.0")
 
     assert updated.software_version == "0.1.0"
+
+
+def test_get_or_create_local_pin_is_six_digits(config):
+    repo = DeviceRepository(Database(config))
+
+    pin = repo.get_or_create_local_pin()
+
+    assert len(pin) == 6
+    assert pin.isdigit()
+
+
+def test_get_or_create_local_pin_is_stable_across_calls(config):
+    repo = DeviceRepository(Database(config))
+
+    first = repo.get_or_create_local_pin()
+    second = repo.get_or_create_local_pin()
+
+    assert first == second
+
+
+def test_get_or_create_local_pin_creates_device_row_if_missing(config):
+    repo = DeviceRepository(Database(config))
+
+    repo.get_or_create_local_pin()
+
+    assert repo.get() is not None
+
+
+def test_local_pin_is_visible_on_the_device_dataclass(config):
+    repo = DeviceRepository(Database(config))
+
+    pin = repo.get_or_create_local_pin()
+    device = repo.get()
+
+    assert device.local_pin == pin

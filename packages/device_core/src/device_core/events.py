@@ -13,7 +13,9 @@ from enum import StrEnum
 
 class EventType(StrEnum):
     DEVICE_PROVISIONED = "device_provisioned"
+    AWAITING_ACTIVATION = "awaiting_activation"
     DEVICE_ACTIVATED = "device_activated"
+    WIFI_ONBOARDING_STARTED = "wifi_onboarding_started"
     WIFI_CONNECTED = "wifi_connected"
     WIFI_DISCONNECTED = "wifi_disconnected"
     ALPACA_CONNECTED = "alpaca_connected"
@@ -22,6 +24,7 @@ class EventType(StrEnum):
     TRADE_EXECUTED = "trade_executed"
     UPDATE_AVAILABLE = "update_available"
     UPDATE_APPLIED = "update_applied"
+    NOTIFICATION = "notification"
     FATAL_ERROR = "fatal_error"
 
 

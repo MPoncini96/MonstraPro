@@ -10,6 +10,13 @@ _EXPECTED_TABLES = {
     "signal",
     "execution_log",
     "device_event",
+    "order",
+    "bot_state",
+    "account_snapshot",
+    "software_release",
+    "position_snapshot",
+    "bot_value_snapshot",
+    "manual_holding",
 }
 
 

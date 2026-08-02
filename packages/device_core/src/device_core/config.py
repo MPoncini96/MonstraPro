@@ -14,6 +14,13 @@ up), and the TOML layer is actively scanned and rejected if it contains
 anything alpaca/credential/secret-shaped - see _reject_credential_keys.
 Credentials live only in the encrypted alpaca_credentials table, reached
 through DeviceCore.credentials / vault.py.
+
+data_dir (persistent customer/device data: DB, encryption key, market data
+cache) and release_dir (replaceable application code: the updater's
+`releases/<version>/` + `current` symlink) are deliberately separate trees
+on Linux - /var/lib/monstrapro and /opt/monstrapro respectively - so wiping
+or replacing an application release never touches device/customer state.
+See image/README.md and ARCHITECTURE.md section 7.
 """
 
 from __future__ import annotations
@@ -49,6 +56,20 @@ def _default_data_dir() -> Path:
     if platform.system() == "Linux":
         return Path("/var/lib/monstrapro")
     return Path("./.data").resolve()
+
+
+def _default_release_dir(data_dir: Path) -> Path:
+    """Releases live under /opt (replaceable application code), separate
+    from data_dir under /var/lib (persistent customer/device data) - see
+    ARCHITECTURE.md and image/README.md. `current`/`releases/<version>`
+    under this path must match deploy image/systemd/*.service's
+    WorkingDirectory=/opt/monstrapro/current exactly, so this is hardcoded
+    on Linux rather than derived from data_dir. Off-Linux (dev/tests) keeps
+    releases nested under data_dir, same as before this split existed, so
+    nothing extra is created outside whatever tmp_path a test already uses."""
+    if platform.system() == "Linux":
+        return Path("/opt/monstrapro")
+    return data_dir / "releases"
 
 
 def _default_config_toml_path() -> Path:
@@ -133,7 +154,7 @@ def load_config(overrides: Mapping[str, Any] | None = None) -> Config:
             raise ConfigError(f"sqlite_url must start with 'sqlite://', got {sqlite_url!r}")
 
         encryption_key_path = Path(values.get("encryption_key_path", data_dir / "device.key")).expanduser()
-        release_dir = Path(values.get("release_dir", data_dir / "releases")).expanduser()
+        release_dir = Path(values.get("release_dir", _default_release_dir(data_dir))).expanduser()
     except ConfigError:
         raise
     except (TypeError, ValueError) as exc:

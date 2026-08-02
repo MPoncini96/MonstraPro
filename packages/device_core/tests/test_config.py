@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 
 from device_core.config import ConfigError, load_config
@@ -10,6 +12,9 @@ def test_defaults_create_data_dir_and_release_dir(tmp_path):
 
     assert config.data_dir == data_dir.resolve()
     assert config.data_dir.exists()
+    # Off-Linux (this test suite's actual runtime), release_dir stays nested
+    # under data_dir - see test_release_dir_is_opt_monstrapro_on_linux for
+    # the real-deployment-target (Linux) default of /opt/monstrapro.
     assert config.release_dir == config.data_dir / "releases"
     assert config.release_dir.exists()
     assert config.encryption_key_path == config.data_dir / "device.key"
@@ -77,3 +82,27 @@ def test_toml_file_with_credential_key_is_rejected(tmp_path, monkeypatch):
 
     with pytest.raises(ConfigError, match="some_credential"):
         load_config(overrides={"data_dir": str(tmp_path / "data")})
+
+
+def test_release_dir_is_opt_monstrapro_on_linux(tmp_path, monkeypatch):
+    """On the real deployment target, releases live under /opt (replaceable
+    application code) independent of data_dir under /var/lib (persistent
+    data) - image/systemd/*.service's WorkingDirectory=/opt/monstrapro/current
+    depends on this exact default. mkdir is stubbed out since this test
+    doesn't run as a user with permission to create /opt/monstrapro on the
+    Linux CI/dev host either."""
+    monkeypatch.setattr("device_core.config.platform.system", lambda: "Linux")
+    monkeypatch.setattr("device_core.config.Path.mkdir", lambda self, **kwargs: None)
+
+    config = load_config(overrides={"data_dir": str(tmp_path / "data")})
+
+    assert config.release_dir == Path("/opt/monstrapro")
+
+
+def test_release_dir_override_still_wins_on_linux(tmp_path, monkeypatch):
+    monkeypatch.setattr("device_core.config.platform.system", lambda: "Linux")
+    monkeypatch.setattr("device_core.config.Path.mkdir", lambda self, **kwargs: None)
+
+    config = load_config(overrides={"data_dir": str(tmp_path / "data"), "release_dir": str(tmp_path / "custom")})
+
+    assert config.release_dir == tmp_path / "custom"

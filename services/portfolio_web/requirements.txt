@@ -1,0 +1,2 @@
+-e ../../packages/device_core
+-e ../../packages/strategy_engine

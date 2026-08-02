@@ -1,0 +1,207 @@
+MONSTRA PRO BOX - GETTING A TEST DEVICE RUNNING
+================================================
+Last updated: 2026-08-02 (added Step 8: editing your portfolio)
+
+IMPORTANT - READ THIS FIRST
+----------------------------
+There is no ready-made "Monstra Pro" image file to flash yet. What exists
+today is:
+
+  - the application code (this repo)
+  - a script (image/scripts/install.sh) that turns a STANDARD Raspberry
+    Pi into a Monstra Pro Box
+
+So "putting the image on the microSD" today actually means two steps:
+flash the normal Raspberry Pi operating system first, then run our
+install script on it. That's what the steps below walk through.
+
+None of this has been tested on real Raspberry Pi 5 hardware yet - this
+is the first real attempt. See "WHAT'S NOT READY YET" at the bottom for
+things that may trip you up.
+
+
+WHAT YOU NEED
+-------------
+  - A Raspberry Pi 5 (2GB or 4GB)
+  - A microSD card (16GB or bigger) and a card reader for this PC
+  - The 3.5 inch LCD screen (goodtft MHS35) that attaches to the Pi
+  - Your home Wi-Fi network name and password (for initial setup)
+  - Raspberry Pi Imager (free) - https://www.raspberrypi.com/software/
+
+
+STEP 1 - Flash Raspberry Pi OS onto the microSD card
+-----------------------------------------------------
+1. Install and open Raspberry Pi Imager on this PC.
+2. Choose Device: Raspberry Pi 5
+3. Choose OS: "Raspberry Pi OS (other)" then "Raspberry Pi OS Lite (64-bit)"
+   (Lite = no desktop. That's correct - the LCD shows Monstra's own
+   screen, not a desktop.)
+4. Choose Storage: your microSD card
+5. Click the gear/settings icon BEFORE writing and set:
+     - Hostname, e.g. monstrapro
+     - Enable SSH, and set a username + password (write these down)
+     - Your Wi-Fi network name and password
+       (This is temporary, just so you can reach the Pi the first time.
+       Step 7 below covers testing the real no-Wi-Fi setup flow.)
+     - Your time zone
+6. Save, then Write, and wait for it to finish and verify.
+
+
+STEP 2 - First boot and connect over SSH
+------------------------------------------
+1. Put the microSD card in the Pi and power it on. No monitor or
+   keyboard is needed if SSH and Wi-Fi were set in Step 1.
+2. From this PC, open a terminal and connect:
+
+       ssh yourusername@monstrapro.local
+
+   If that address doesn't work, check your router's connected-devices
+   list for the Pi's IP address and use that instead.
+
+
+STEP 3 - Copy this repo onto the Pi
+--------------------------------------
+From the Pi's own SSH session (it has internet via the Wi-Fi from Step 1):
+
+       git clone <your repo URL> ~/MonstraPro
+
+If the repo isn't pushed anywhere yet, copy the folder from this PC to
+the Pi instead (scp, WinSCP, etc.) to the same ~/MonstraPro location.
+
+
+STEP 4 - Run the installer
+-----------------------------
+On the Pi, over SSH:
+
+1. Preview first - this only prints what it would do, changes nothing:
+
+       cd ~/MonstraPro
+       sudo image/scripts/install.sh --dry-run
+
+   Read through the output before continuing.
+
+2. Run it for real:
+
+       sudo image/scripts/install.sh
+
+This sets up:
+  - a dedicated "monstrapro" user (the app never runs as root)
+  - /opt/monstrapro and /var/lib/monstrapro folders
+  - a Python environment for each service
+  - the systemd services that start everything automatically at boot
+  - a local copy of the LCD driver (goodtft/LCD-show), downloaded once
+    right here so the Pi never needs internet later just to get its
+    screen working
+
+
+STEP 5 - Reboot (it will reboot itself again - that's normal)
+-----------------------------------------------------------------
+1. Reboot the Pi:
+
+       sudo reboot
+
+2. The LCD driver installs itself on this first boot and will
+   AUTOMATICALLY REBOOT THE PI A SECOND TIME on its own, within a
+   minute or so. This is expected - don't unplug it, just let it happen.
+3. Once it settles, connect the 3.5 inch LCD screen to the Pi if it
+   isn't already connected. You can disconnect HDMI at this point -
+   it's not needed anymore.
+
+
+STEP 6 - Watch it come up (optional, but useful the first time)
+---------------------------------------------------------------
+SSH back in and run any of these (Ctrl+C to stop watching):
+
+       journalctl -u monstrapro-lcd-setup -f
+       journalctl -u monstrapro-agent -f
+       journalctl -u monstrapro-display -f
+       journalctl -u monstrapro-worker -f
+       journalctl -u monstrapro-portfolio-web -f
+
+
+STEP 7 - Test the real first-boot experience (no saved Wi-Fi)
+-------------------------------------------------------------
+Step 1 gave the Pi Wi-Fi automatically, which is fine for testing the
+install itself, but it skips the actual customer experience. To test
+that too:
+
+1. SSH into the Pi and find/remove the saved Wi-Fi connection:
+
+       nmcli connection show
+       sudo nmcli connection delete "<name from the list above>"
+
+2. Reboot: sudo reboot
+3. The Pi should create its own temporary Wi-Fi hotspot named something
+   like "MonstraPro-XXXX", and the LCD screen should show:
+
+       Connect your phone to MonstraPro-XXXX
+       Then visit setup.monstra
+
+4. On your phone, join that Wi-Fi network, open a browser, go to
+   setup.monstra, and submit your real home Wi-Fi network name and
+   password.
+5. The Pi should join that network, and the screen should move on to
+   an activation/pairing-code screen.
+
+
+STEP 8 - Edit your portfolio from the local web page
+------------------------------------------------------
+Once the Pi is on your home Wi-Fi (Step 1 or Step 7), a second local page
+stays available permanently - not just during first-boot setup - so you
+can come back to it anytime.
+
+1. Look at the device's own LCD screen. On every idle screen (whichever
+   one is currently rotating through - Portfolio, a bot, or a stock) there
+   is a small line at the bottom:
+
+       monstrapro.local   PIN 482913
+
+   (Your PIN will be a different 6-digit number - it's generated once per
+   device.)
+
+2. On your phone or this PC, browse to:
+
+       http://monstrapro.local
+
+   If that address doesn't load, use the Pi's IP address instead (same as
+   Step 2).
+
+3. Enter the PIN shown on the screen to unlock the page.
+4. From there you can:
+     - Turn the three available bots (Force, Aptet, Draco) on or off.
+       You don't set their weights directly - each one manages its own
+       allocation once it's active.
+     - Add a "locked" individual stock: enter a symbol and a share
+       quantity. The device will buy up to that quantity and then leave
+       it alone permanently - none of the bots will ever buy or sell it.
+     - Remove a locked stock: this only stops protecting it going
+       forward. It does NOT sell your shares - they stay in the account.
+
+Note: this local page is separate from monstra.pro's own bot picker on
+the website. Right now the two don't stay in sync with each other - if
+you edit both, whichever you look at last is what's actually true. Pick
+one place to make changes for now.
+
+
+WHAT'S NOT READY YET (don't be surprised if you hit these)
+------------------------------------------------------------
+  - No real signed software releases exist yet - the updater checks but
+    won't actually apply an update.
+  - Letting the app control Wi-Fi and restart its own services may need
+    one extra permissions step on the Pi that hasn't been scripted yet.
+    If Wi-Fi setup or updates fail with a permissions-looking error,
+    this is the likely reason.
+  - The LCD driver (goodtft/LCD-show) predates the Raspberry Pi 5 - it's
+    expected to work, but hasn't been confirmed on this exact hardware.
+  - The exact screen resolution for the physical panel isn't confirmed
+    yet - the software supports more than one size, but hasn't been
+    checked against the real unit.
+  - The portfolio page (Step 8) is plain HTTP, not HTTPS - fine on a
+    trusted home network, but the PIN and your choices travel unencrypted
+    on the local Wi-Fi. Don't use it on a network you don't trust.
+  - monstrapro.local relies on your router supporting mDNS/Bonjour-style
+    discovery - most home routers do, but if it doesn't load, use the
+    Pi's IP address instead.
+
+For the full technical picture, see image/README.md in this repo. If
+anything here is confusing or doesn't match what you see, just ask.

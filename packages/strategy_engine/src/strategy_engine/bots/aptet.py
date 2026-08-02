@@ -1,0 +1,624 @@
+"""bots/aptet.py — "Aptet" algorithm.
+
+Ported from Monstra-Worker/bots/aptet.py. The adaptive-parameter-search and
+risk-off/momentum ranking math is unchanged from the original. What changed
+for the Pro Box port:
+
+- `run_aptet(bot_id, use_db_config=True)` (which loaded config via
+  `db.get_conn`/`trading.aptet` and read prices from either a Postgres
+  `trading."Market_Data"` cache or direct `yfinance` calls) becomes
+  `run_aptet(config, state=None)`, a pure function over an already-resolved
+  config dict, fetching prices through the shared
+  `strategy_engine.market_data.provider` (Alpaca-primary) instead. This
+  drops the batched-chunk/retry/Postgres-cache fallback ladder the original
+  needed to work around yfinance rate limits — Alpaca's paginated bars
+  endpoint doesn't need it.
+- aptet has no cross-run state either: `run_aptet` already rebuilds its own
+  adaptation history by replaying `resolve_aptet_decision` over the
+  downloaded price window on every call (see the replay loop at the bottom
+  of `run_aptet`), so nothing needs to be persisted between runs. `state` is
+  accepted for signature symmetry with draco but always ignored.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+import logging
+from typing import Any
+
+import numpy as np
+import pandas as pd
+
+from strategy_engine.bot_identity import BOT_TYPE_APTET
+from strategy_engine.market_data.provider import get_daily_bars
+
+DEFAULT_UNIVERSE = [
+    "LLY", "NVO", "VRTX", "REGN", "ALNY", "CRSP", "ISRG", "SYK", "BSX",
+    "ABT", "MDT", "TMO", "DHR", "ILMN", "UNH", "HCA", "GILD", "MRNA",
+    "DXCM", "GEHC", "PODD", "CVS", "BDX", "AZN", "ABBV",
+]
+DEFAULT_FALLBACK_TICKER = "VOO"
+DEFAULT_BENCHMARK_TICKER = "VOO"
+DEFAULT_LOOKBACK_DAYS = 30
+DEFAULT_MIN_HOLDINGS = 2
+DEFAULT_MAX_HOLDINGS = 8
+DEFAULT_ADAPTATION_SPEED = "balanced"
+PARAMETER_REVIEW_DAYS = 5
+MIN_OPTIMIZATION_SAMPLES = 20
+TOP_RETURN_THRESHOLD = 0.0
+BENCHMARK_RETURN_THRESHOLD = 0.0
+REQUIRE_FULL_LOOKBACK_WINDOW = True
+USE_FALLBACK_TICKER = True
+BENCHMARK_FILTER_ENABLED = False
+APTET_LIVE_EQUITY_SOURCE = "live trading"
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class AdaptationProfile:
+    candidate_lookbacks: list[int]
+    optimization_train_days: int
+    optimization_check_days: int
+
+
+ADAPTATION_PROFILES: dict[str, AdaptationProfile] = {
+    "conservative": AdaptationProfile([20, 25, 30], 63, 15),
+    "balanced": AdaptationProfile([10, 15, 20, 25, 30], 42, 10),
+    "aggressive": AdaptationProfile([5, 10, 15, 20], 30, 5),
+}
+
+
+@dataclass
+class AptetConfig:
+    universe: list[str]
+    fallback_ticker: str
+    benchmark_ticker: str = DEFAULT_BENCHMARK_TICKER
+    min_holdings: int = DEFAULT_MIN_HOLDINGS
+    max_holdings: int = DEFAULT_MAX_HOLDINGS
+    adaptation_speed: str = DEFAULT_ADAPTATION_SPEED
+    risk_off_enabled: bool = True
+    history_period: str | None = None
+    interval: str = "1d"
+    bot_id: str | None = None
+
+
+@dataclass
+class AptetAdaptationState:
+    selected_lookback_days: int | None = None
+    selected_top_n: int | None = None
+    realized_returns_since_change: list[float] = field(default_factory=list)
+
+
+def _clean_ticker(value: Any, fallback: str | None = None) -> str | None:
+    if value is None:
+        return fallback
+    ticker = str(value).strip().upper()
+    return ticker or fallback
+
+
+def _safe_int(value: Any, fallback: int, minimum: int = 1) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = fallback
+    return max(minimum, parsed)
+
+
+def _safe_bool(value: Any, fallback: bool) -> bool:
+    if value is None:
+        return fallback
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "t", "yes", "y", "on"}:
+            return True
+        if lowered in {"0", "false", "f", "no", "n", "off"}:
+            return False
+    return bool(value)
+
+
+def _normalize_universe(raw_universe: Any, fallback_ticker: str | None = None) -> list[str]:
+    if not isinstance(raw_universe, (list, tuple)):
+        return []
+    fallback = _clean_ticker(fallback_ticker)
+    seen: set[str] = set()
+    normalized: list[str] = []
+    for item in raw_universe:
+        ticker = _clean_ticker(item)
+        if not ticker or ticker == fallback or ticker in seen:
+            continue
+        seen.add(ticker)
+        normalized.append(ticker)
+    return normalized
+
+
+def _parse_period_days(history_period: str | None) -> int:
+    if not history_period:
+        return 0
+    token = history_period.strip().lower()
+    if len(token) < 2:
+        return 0
+    try:
+        qty = int(token[:-1])
+    except ValueError:
+        return 0
+    return qty * {"d": 1, "w": 7, "m": 30, "y": 365}.get(token[-1], 0)
+
+
+def _adaptation_profile(config: AptetConfig) -> AdaptationProfile:
+    return ADAPTATION_PROFILES.get(config.adaptation_speed, ADAPTATION_PROFILES[DEFAULT_ADAPTATION_SPEED])
+
+
+def candidate_top_ns(config: AptetConfig) -> list[int]:
+    max_holdings = min(len(config.universe), max(1, int(config.max_holdings)))
+    min_holdings = min(max_holdings, max(1, int(config.min_holdings)))
+    return list(range(min_holdings, max_holdings + 1)) if max_holdings >= 1 else [DEFAULT_MIN_HOLDINGS]
+
+
+def _bounded_candidate_top_ns(config: AptetConfig, previous_selected_top_n: int | None = None) -> list[int]:
+    top_ns = candidate_top_ns(config)
+    if previous_selected_top_n is None:
+        return top_ns
+    bounded = [top_n for top_n in top_ns if abs(int(top_n) - int(previous_selected_top_n)) <= 1]
+    return bounded or top_ns
+
+
+def _rolling_compounded_return(daily_returns: list[float]) -> float | None:
+    if not daily_returns:
+        return None
+    compounded = 1.0
+    for daily_return in daily_returns:
+        compounded *= 1.0 + float(daily_return)
+    return compounded - 1.0
+
+
+def _advance_adaptation_state(
+    state: AptetAdaptationState | None,
+    metadata: dict[str, Any],
+    realized_return: float,
+) -> AptetAdaptationState:
+    selected_lookback = metadata.get("selectedLookbackDays")
+    selected_top_n = metadata.get("selectedTopN")
+    lookback_value = int(selected_lookback) if selected_lookback is not None else None
+    top_n_value = int(selected_top_n) if selected_top_n is not None else None
+    current = state or AptetAdaptationState()
+    parameter_changed = (
+        current.selected_lookback_days != lookback_value or current.selected_top_n != top_n_value
+    )
+    realized_returns = [] if parameter_changed else list(current.realized_returns_since_change)
+    realized_returns.append(float(realized_return))
+    return AptetAdaptationState(
+        selected_lookback_days=lookback_value,
+        selected_top_n=top_n_value,
+        realized_returns_since_change=realized_returns[-PARAMETER_REVIEW_DAYS:],
+    )
+
+
+def aptet_config_from_dict(data: dict[str, Any] | None, *, bot_id: str | None = None) -> AptetConfig:
+    """Build an AptetConfig from a resolved strategy_config params dict."""
+    raw = data or {}
+    fallback_ticker = _clean_ticker(raw.get("fallback_ticker"), DEFAULT_FALLBACK_TICKER) or DEFAULT_FALLBACK_TICKER
+    universe = _normalize_universe(raw.get("universe"), fallback_ticker) or list(DEFAULT_UNIVERSE)
+    max_holdings = min(len(universe), _safe_int(raw.get("max_holdings"), DEFAULT_MAX_HOLDINGS), 10)
+    min_holdings = min(max_holdings, _safe_int(raw.get("min_holdings"), DEFAULT_MIN_HOLDINGS))
+    adaptation_speed = str(raw.get("adaptation_speed") or DEFAULT_ADAPTATION_SPEED).strip().lower() or DEFAULT_ADAPTATION_SPEED
+    if adaptation_speed not in ADAPTATION_PROFILES:
+        adaptation_speed = DEFAULT_ADAPTATION_SPEED
+    return AptetConfig(
+        universe=universe,
+        fallback_ticker=fallback_ticker,
+        benchmark_ticker=_clean_ticker(raw.get("benchmark_ticker"), DEFAULT_BENCHMARK_TICKER) or DEFAULT_BENCHMARK_TICKER,
+        min_holdings=min_holdings,
+        max_holdings=max_holdings,
+        adaptation_speed=adaptation_speed,
+        risk_off_enabled=_safe_bool(raw.get("risk_off_enabled"), True),
+        history_period=(str(raw.get("history_period") or "").strip() or None),
+        interval=str(raw.get("interval") or "1d").strip() or "1d",
+        bot_id=bot_id or (str(raw.get("bot_id")).strip() if raw.get("bot_id") is not None else None),
+    )
+
+
+def _resolve_download_window(config: AptetConfig) -> tuple[str, str]:
+    today = datetime.now(timezone.utc).date()
+    profile = _adaptation_profile(config)
+    buffer_days = max(_parse_period_days(config.history_period), profile.optimization_train_days + max(profile.candidate_lookbacks) + 45, 180)
+    return (today - timedelta(days=buffer_days)).isoformat(), (today + timedelta(days=1)).isoformat()
+
+
+def _requested_symbols(config: AptetConfig) -> list[str]:
+    symbols = list(config.universe)
+    for symbol in (config.fallback_ticker, config.benchmark_ticker):
+        if symbol and symbol not in symbols:
+            symbols.append(symbol)
+    return symbols
+
+
+def _normalize_downloaded_prices(prices: pd.DataFrame, requested_symbols: list[str]) -> pd.DataFrame:
+    if prices is None or prices.empty:
+        return pd.DataFrame()
+    normalized = prices.copy()
+    normalized.index = pd.to_datetime(normalized.index)
+    normalized = normalized.sort_index()
+    normalized = normalized[~normalized.index.duplicated(keep="last")]
+    normalized.columns = [str(col).upper() for col in normalized.columns]
+    normalized = normalized.loc[:, normalized.columns.isin([symbol.upper() for symbol in requested_symbols])]
+    normalized = normalized.apply(pd.to_numeric, errors="coerce").astype("float64")
+    normalized = normalized.dropna(axis=1, how="all")
+    normalized = normalized.dropna(how="all")
+    return normalized
+
+
+def _has_minimum_usable_symbols(prices: pd.DataFrame, config: AptetConfig) -> bool:
+    if prices.empty:
+        logger.error("Aptet price load produced no usable prices bot_id=%s", config.bot_id)
+        return False
+    available_symbols = {str(column).upper() for column in prices.columns if prices[column].notna().any()}
+    if config.fallback_ticker.upper() not in available_symbols:
+        logger.error("Aptet price load missing fallback ticker bot_id=%s fallback=%s", config.bot_id, config.fallback_ticker)
+        return False
+    ranked_symbols = [symbol for symbol in config.universe if symbol.upper() in available_symbols]
+    if len(ranked_symbols) < int(config.min_holdings):
+        logger.error(
+            "Aptet price load insufficient ranked symbols bot_id=%s available=%d required=%d",
+            config.bot_id,
+            len(ranked_symbols),
+            int(config.min_holdings),
+        )
+        return False
+    return True
+
+
+def _build_price_frame(config: AptetConfig, start_date: str, end_date: str) -> pd.DataFrame:
+    requested_symbols = [symbol.upper() for symbol in _requested_symbols(config)]
+    if not requested_symbols:
+        return pd.DataFrame()
+
+    raw = get_daily_bars(requested_symbols, start_date, end_date, adjusted=True)
+    if raw is None or raw.empty:
+        prices = pd.DataFrame()
+    elif isinstance(raw.columns, pd.MultiIndex):
+        prices = raw["Close"].copy() if "Close" in raw.columns.get_level_values(0) else pd.DataFrame()
+    elif "Close" in raw.columns:
+        prices = raw[["Close"]].rename(columns={"Close": requested_symbols[0]})
+    else:
+        prices = pd.DataFrame()
+
+    prices = _normalize_downloaded_prices(prices, requested_symbols)
+    ordered_columns = [symbol for symbol in requested_symbols if symbol in prices.columns]
+    prices = prices.reindex(columns=ordered_columns)
+
+    missing_symbols = [symbol for symbol in requested_symbols if symbol not in prices.columns]
+    if missing_symbols:
+        logger.warning("Aptet missing price history bot_id=%s symbols=%s", config.bot_id, missing_symbols)
+    if not _has_minimum_usable_symbols(prices, config):
+        return pd.DataFrame()
+    return prices
+
+
+def download_aptet_prices(config: AptetConfig, start_date: str, end_date: str) -> pd.DataFrame:
+    return _build_price_frame(config, start_date, end_date)
+
+
+def _get_trailing_returns(prices: pd.DataFrame, end_idx_exclusive: int, lookback_days: int, symbols: set[str] | None = None) -> pd.Series:
+    start_idx = max(0, end_idx_exclusive - lookback_days)
+    window = prices.iloc[start_idx:end_idx_exclusive]
+    if len(window) < 2:
+        return pd.Series(dtype=float)
+
+    window_values = window.to_numpy(dtype="float64", copy=False)
+    if window_values.ndim != 2 or window_values.shape[0] < 2:
+        return pd.Series(dtype=float)
+
+    if REQUIRE_FULL_LOOKBACK_WINDOW:
+        valid_mask = np.isfinite(window_values).all(axis=0)
+    else:
+        valid_mask = np.isfinite(window_values[0]) & np.isfinite(window_values[-1])
+
+    if symbols is not None:
+        symbol_mask = np.fromiter((column in symbols for column in window.columns), dtype=bool, count=len(window.columns))
+        valid_mask = valid_mask & symbol_mask
+
+    if not bool(valid_mask.any()):
+        return pd.Series(dtype=float)
+
+    first = window_values[0, valid_mask]
+    last = window_values[-1, valid_mask]
+    columns = window.columns.to_numpy(copy=False)[valid_mask]
+
+    positive_first = np.isfinite(first) & np.isfinite(last) & (first > 0.0)
+    if not bool(positive_first.any()):
+        return pd.Series(dtype=float)
+
+    first = first[positive_first]
+    last = last[positive_first]
+    columns = columns[positive_first]
+
+    trailing_values = (last / first) - 1.0
+    finite_mask = np.isfinite(trailing_values)
+    if not bool(finite_mask.any()):
+        return pd.Series(dtype=float)
+
+    return pd.Series(trailing_values[finite_mask], index=columns[finite_mask], dtype=float)
+
+
+def _evaluate_risk_off(config: AptetConfig, ranked_trailing: pd.Series, benchmark_trailing: pd.Series) -> tuple[bool, str]:
+    reasons: list[str] = []
+    if config.risk_off_enabled:
+        if ranked_trailing.empty:
+            reasons.append("no_ranked_candidates")
+        else:
+            top_ret = float(ranked_trailing.max())
+            if top_ret <= TOP_RETURN_THRESHOLD:
+                reasons.append(f"top_non_positive:{top_ret:.6f}")
+    if BENCHMARK_FILTER_ENABLED:
+        benchmark_ret = benchmark_trailing.get(config.benchmark_ticker, np.nan)
+        if pd.isna(benchmark_ret) or float(benchmark_ret) <= BENCHMARK_RETURN_THRESHOLD:
+            reasons.append("benchmark_filter_failed")
+    return (True, "; ".join(reasons)) if reasons else (False, "risk_on")
+
+
+def _equal_weight_holdings(ranked_trailing: pd.Series, top_n: int) -> tuple[list[str], np.ndarray]:
+    if ranked_trailing.empty:
+        return [], np.array([], dtype=float)
+    selected = ranked_trailing.sort_values(ascending=False).head(top_n).index.tolist()
+    if not selected:
+        return [], np.array([], dtype=float)
+    return selected, np.ones(len(selected), dtype=float) / float(len(selected))
+
+
+def _choose_holdings_for_day(config: AptetConfig, ranked_trailing: pd.Series, benchmark_trailing: pd.Series, top_n: int) -> tuple[list[str], np.ndarray, bool, str]:
+    risk_off, reason = _evaluate_risk_off(config, ranked_trailing, benchmark_trailing)
+    if risk_off:
+        return [config.fallback_ticker], np.array([1.0], dtype=float), True, reason
+    selected, weights = _equal_weight_holdings(ranked_trailing, top_n)
+    if not selected and USE_FALLBACK_TICKER:
+        return [config.fallback_ticker], np.array([1.0], dtype=float), True, "no_selected_symbols"
+    return selected, weights, False, reason
+
+
+def _compute_weighted_period_return(today: pd.Series, tomorrow: pd.Series, selected_symbols: list[str], weights: np.ndarray) -> float:
+    period_return = 0.0
+    for ticker, weight in zip(selected_symbols, weights):
+        p0 = today.get(ticker, np.nan)
+        p1 = tomorrow.get(ticker, np.nan)
+        if pd.isna(p0) or pd.isna(p1) or float(p0) <= 0:
+            return 0.0
+        period_return += float(weight) * ((float(p1) / float(p0)) - 1.0)
+    return float(period_return)
+
+
+def _simulate_param_combo(prices: pd.DataFrame, config: AptetConfig, lookback: int, top_n: int) -> dict[str, Any] | None:
+    profile = _adaptation_profile(config)
+    start_idx = max(lookback + 1, len(prices.index) - profile.optimization_train_days)
+    end_idx = len(prices.index) - 1
+    ranking_universe = set(config.universe)
+    benchmark_symbols = {config.benchmark_ticker} if config.benchmark_ticker else set()
+    daily_returns: list[float] = []
+    for idx in range(start_idx, end_idx):
+        ranked_trailing = _get_trailing_returns(prices, idx, lookback, ranking_universe)
+        benchmark_trailing = _get_trailing_returns(prices, idx, lookback, benchmark_symbols)
+        selected, weights, _risk_off, _reason = _choose_holdings_for_day(config, ranked_trailing, benchmark_trailing, top_n)
+        today = prices.iloc[idx]
+        tomorrow = prices.iloc[idx + 1]
+        period_return = 0.0
+        valid = True
+        for ticker, weight in zip(selected, weights):
+            p0 = today.get(ticker, np.nan)
+            p1 = tomorrow.get(ticker, np.nan)
+            if pd.isna(p0) or pd.isna(p1) or float(p0) <= 0:
+                valid = False
+                break
+            period_return += float(weight) * ((float(p1) / float(p0)) - 1.0)
+        if valid:
+            daily_returns.append(period_return)
+    if len(daily_returns) < MIN_OPTIMIZATION_SAMPLES:
+        return None
+    returns = pd.Series(daily_returns, dtype=float)
+    equity = (1.0 + returns).cumprod()
+    total_return = float(equity.iloc[-1] - 1.0)
+    running_max = equity.cummax()
+    drawdown = (equity / running_max) - 1.0
+    max_drawdown = float(drawdown.min())
+    volatility = float(returns.std())
+    sharpe_like = float((returns.mean() / volatility) * np.sqrt(252)) if volatility > 0 else 0.0
+    return {
+        "selectedLookbackDays": int(lookback),
+        "selectedTopN": int(top_n),
+        "score": total_return + sharpe_like * 0.05 + max_drawdown * 0.50,
+        "totalReturn": total_return,
+        "maxDrawdown": max_drawdown,
+        "sharpeLike": sharpe_like,
+    }
+
+
+def optimize_aptet_params(
+    prices: pd.DataFrame,
+    config: AptetConfig,
+    *,
+    end_idx_exclusive: int | None = None,
+    previous_selected_top_n: int | None = None,
+) -> dict[str, Any] | None:
+    view = prices if end_idx_exclusive is None else prices.iloc[:end_idx_exclusive]
+    if view.empty:
+        return None
+    profile = _adaptation_profile(config)
+    top_ns = _bounded_candidate_top_ns(config, previous_selected_top_n)
+    best: dict[str, Any] | None = None
+    for lookback in profile.candidate_lookbacks:
+        for top_n in top_ns:
+            result = _simulate_param_combo(view, config, lookback, top_n)
+            if result is None:
+                continue
+            if best is None or float(result["score"]) > float(best["score"]):
+                best = result
+    if best is None:
+        return None
+    return {
+        **best,
+        "candidateLookbacks": list(profile.candidate_lookbacks),
+        "candidateTopNs": list(top_ns),
+        "adaptationSpeed": config.adaptation_speed,
+        "optimizationTrainDays": int(profile.optimization_train_days),
+        "optimizationCheckDays": int(profile.optimization_check_days),
+        "lastOptimizationDate": str(view.index[-1].date()),
+    }
+
+
+def resolve_aptet_decision(
+    prices: pd.DataFrame,
+    config: AptetConfig,
+    *,
+    end_idx_exclusive: int | None = None,
+    previous_selected_top_n: int | None = None,
+    adaptation_state: AptetAdaptationState | None = None,
+) -> tuple[list[str], np.ndarray, bool, str, dict[str, Any]]:
+    if not all(pd.api.types.is_float_dtype(dtype) for dtype in prices.dtypes):
+        prices = prices.astype("float64")
+    view_end = int(end_idx_exclusive if end_idx_exclusive is not None else len(prices.index))
+    profile = _adaptation_profile(config)
+    prior_top_n = int(adaptation_state.selected_top_n) if adaptation_state and adaptation_state.selected_top_n is not None else (int(previous_selected_top_n) if previous_selected_top_n is not None else None)
+    prior_lookback = int(adaptation_state.selected_lookback_days) if adaptation_state and adaptation_state.selected_lookback_days is not None else None
+    recent_returns = list(adaptation_state.realized_returns_since_change) if adaptation_state else []
+    trailing_review_return = _rolling_compounded_return(recent_returns[-PARAMETER_REVIEW_DAYS:]) if len(recent_returns) >= PARAMETER_REVIEW_DAYS else None
+    should_search = prior_top_n is None or prior_lookback is None
+    search_reason = "initial_selection" if should_search else "hold_current_parameters"
+    if not should_search and trailing_review_return is not None and trailing_review_return < 0.0:
+        should_search = True
+        search_reason = "negative_last_5d_since_change"
+    top_ns = _bounded_candidate_top_ns(config, prior_top_n)
+    best: dict[str, Any] | None = None
+    if should_search:
+        best = optimize_aptet_params(
+            prices,
+            config,
+            end_idx_exclusive=view_end,
+            previous_selected_top_n=prior_top_n,
+        )
+    selected_lookback = int(best["selectedLookbackDays"]) if best else (prior_lookback if prior_lookback is not None else DEFAULT_LOOKBACK_DAYS)
+    selected_top_n = int(best["selectedTopN"]) if best else (prior_top_n if prior_top_n is not None else min(DEFAULT_MIN_HOLDINGS, max(1, len(config.universe))))
+    parameter_changed = prior_lookback != selected_lookback or prior_top_n != selected_top_n
+    metadata: dict[str, Any] = {
+        "selectedLookbackDays": selected_lookback,
+        "selectedTopN": selected_top_n,
+        "candidateLookbacks": list(profile.candidate_lookbacks),
+        "candidateTopNs": list(top_ns),
+        "adaptationSpeed": config.adaptation_speed,
+        "optimizationTrainDays": int(profile.optimization_train_days),
+        "optimizationCheckDays": int(profile.optimization_check_days),
+        "lastOptimizationDate": best.get("lastOptimizationDate") if best else None,
+        "riskOffReason": None,
+        "fallbackTicker": config.fallback_ticker,
+        "rankedTrailingReturns": {},
+        "optimizationScore": best.get("score") if best else None,
+        "usedDefaultParameters": best is None and prior_top_n is None,
+        "previousSelectedTopN": prior_top_n,
+        "previousSelectedLookbackDays": prior_lookback,
+        "parameterSearchTriggered": bool(should_search),
+        "parameterSearchReason": search_reason,
+        "parameterChanged": bool(parameter_changed),
+        "parameterReviewDays": PARAMETER_REVIEW_DAYS,
+        "daysSinceParameterChange": len(recent_returns),
+        "trailingReturnSinceLastChange5D": trailing_review_return,
+    }
+    if view_end < selected_lookback + 1:
+        metadata["riskOffReason"] = "no_history"
+        return [config.fallback_ticker], np.array([1.0], dtype=float), True, "no_history", metadata
+    ranking_universe = set(config.universe)
+    benchmark_symbols = {config.benchmark_ticker} if config.benchmark_ticker else set()
+    ranked_trailing = _get_trailing_returns(prices, view_end, selected_lookback, ranking_universe)
+    benchmark_trailing = _get_trailing_returns(prices, view_end, selected_lookback, benchmark_symbols)
+    selected_symbols, weights, risk_off, risk_reason = _choose_holdings_for_day(config, ranked_trailing, benchmark_trailing, selected_top_n)
+    if selected_symbols:
+        metadata["rankedTrailingReturns"] = {symbol: float(ranked_trailing.get(symbol)) for symbol in selected_symbols if symbol in ranked_trailing.index}
+    metadata["riskOffReason"] = risk_reason if risk_off else None
+    return selected_symbols, weights, risk_off, risk_reason, metadata
+
+
+def run_aptet(config: dict[str, Any], state: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Aptet live signal generator.
+
+    Args:
+        config: resolved strategy_config params for this bot instance
+            (bot_id + AptetConfig fields — see aptet_config_from_dict).
+        state: unused; aptet rebuilds its own adaptation history from price
+            data every call (see the replay loop below). Accepted for
+            signature symmetry with draco.
+    """
+    bot_id = str(config.get("bot_id") or "aptet")
+    ts = datetime.now(timezone.utc)
+    aptet_config = aptet_config_from_dict(config, bot_id=bot_id)
+    start_date, end_date = _resolve_download_window(aptet_config)
+    prices = _build_price_frame(aptet_config, start_date, end_date)
+    if prices.empty or len(prices.index) < 2:
+        fallback = aptet_config.fallback_ticker or DEFAULT_FALLBACK_TICKER
+        profile = _adaptation_profile(aptet_config)
+        return {
+            "bot_id": bot_id,
+            "bot_type": BOT_TYPE_APTET,
+            "ts": ts,
+            "signal": "HOLD",
+            "note": f"Not enough {aptet_config.interval} history; holding {fallback}",
+            "payload": {
+                "asof": None,
+                "interval": aptet_config.interval,
+                "target_weights": {fallback: 1.0},
+                "selectedLookbackDays": DEFAULT_LOOKBACK_DAYS,
+                "selectedTopN": min(DEFAULT_MIN_HOLDINGS, max(1, len(aptet_config.universe))),
+                "candidateLookbacks": list(profile.candidate_lookbacks),
+                "candidateTopNs": list(candidate_top_ns(aptet_config)),
+                "adaptationSpeed": aptet_config.adaptation_speed,
+                "optimizationTrainDays": profile.optimization_train_days,
+                "optimizationCheckDays": profile.optimization_check_days,
+                "lastOptimizationDate": None,
+                "riskOffReason": "no_history",
+                "fallbackTicker": fallback,
+                "rankedTrailingReturns": {},
+            },
+            "state": None,
+        }
+    adaptation_state: AptetAdaptationState | None = None
+    if len(prices.index) > 2:
+        for index in range(1, len(prices.index) - 1):
+            selected_symbols, weights, _risk_off, _risk_reason, replay_metadata = resolve_aptet_decision(
+                prices,
+                aptet_config,
+                end_idx_exclusive=index,
+                adaptation_state=adaptation_state,
+            )
+            realized_return = _compute_weighted_period_return(prices.iloc[index], prices.iloc[index + 1], selected_symbols, weights)
+            adaptation_state = _advance_adaptation_state(adaptation_state, replay_metadata, realized_return)
+    selected_symbols, weights, risk_off, risk_reason, metadata = resolve_aptet_decision(
+        prices,
+        aptet_config,
+        adaptation_state=adaptation_state,
+    )
+    asof = prices.index[-1]
+    target_weights = {symbol: float(weight) for symbol, weight in zip(selected_symbols, weights)}
+    if not target_weights:
+        fallback = aptet_config.fallback_ticker or DEFAULT_FALLBACK_TICKER
+        target_weights = {fallback: 1.0}
+        risk_off = True
+        risk_reason = risk_reason or "no_selected_symbols"
+        metadata["riskOffReason"] = risk_reason
+    note = f"As of {asof.date()}: fallback to {', '.join(target_weights.keys())} ({risk_reason})" if risk_off else f"As of {asof.date()}: selected {', '.join(selected_symbols)}"
+    return {
+        "bot_id": bot_id,
+        "bot_type": BOT_TYPE_APTET,
+        "ts": ts,
+        "signal": "REBALANCE" if target_weights else "HOLD",
+        "note": note,
+        "payload": {
+            "asof": str(asof),
+            "interval": aptet_config.interval,
+            "universeSize": len(aptet_config.universe),
+            "benchmarkTicker": aptet_config.benchmark_ticker,
+            "riskOff": bool(risk_off),
+            "target_weights": target_weights,
+            **metadata,
+        },
+        "equity_source": APTET_LIVE_EQUITY_SOURCE,
+        "state": None,
+    }

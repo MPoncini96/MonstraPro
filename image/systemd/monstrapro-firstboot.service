@@ -1,0 +1,17 @@
+[Unit]
+Description=Monstra.Pro Box first-boot bootstrap (idempotent, runs once per image)
+After=local-fs.target
+Before=monstrapro-agent.service monstrapro-worker.service monstrapro-display.service
+ConditionPathExists=!/var/lib/monstrapro/.firstboot-complete
+
+[Service]
+# Runs as root, unlike the four "normal" Monstra services - this is a
+# one-shot bootstrap step whose only job is making /opt/monstrapro and
+# /var/lib/monstrapro writable by the non-root `monstrapro` user *before*
+# any of those services start. See image/README.md "Boot order".
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/monstrapro/current/image/scripts/first-boot.sh
+
+[Install]
+WantedBy=multi-user.target

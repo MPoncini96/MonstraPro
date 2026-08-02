@@ -12,8 +12,11 @@ credentials — everything trading-related happens on the device.
 
 ## Status
 
-Architecture designed, foundational scaffold in place. Services under
-`services/` are stubs (`NotImplementedError`) pending implementation.
+Architecture implemented and tested (see SESSION_SUMMARY.txt for the full
+history). `image/` now provides the Raspberry Pi OS Lite boot foundation —
+systemd units, first-boot bootstrap, and Wi-Fi onboarding — but no real
+bootable image has been built or flashed yet; see
+[image/README.md](image/README.md) for what remains.
 
 ## Layout
 
@@ -21,11 +24,14 @@ Architecture designed, foundational scaffold in place. Services under
   Monstra.bot.
 - `packages/device_core` — shared appliance infrastructure (config, DB,
   crypto, logging, local eventing).
+- `services/device_agent` — first-boot Wi-Fi onboarding: temporary access
+  point + local setup page + NetworkManager join.
 - `services/trading_worker` — scheduler, activation state machine, order
   execution against Alpaca.
 - `services/display` — always-on status display renderer.
 - `services/updater` — checks monstra.pro for releases and applies updates.
-- `deploy/systemd` — unit/timer files for the three services.
+- `image/` — Raspberry Pi image configuration, systemd units, install/
+  first-boot scripts, and docs. See [image/README.md](image/README.md).
 
 ## Local development
 

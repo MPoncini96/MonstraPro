@@ -1,0 +1,246 @@
+MONSTRA.PRO BOX — SESSION SUMMARY
+Generated: 2026-08-02
+Repos touched: C:\dev\MonstraPro (Track A) and C:\dev\NextJS_Monsta (Track B)
+
+===============================================================================
+CONTEXT
+===============================================================================
+
+Starting point: MonstraPro folder had an architecture doc and a foundational
+scaffold (device_core mostly built, everything else stubbed with
+NotImplementedError). The user then supplied Objectives.txt describing the
+full product: a Raspberry Pi 5 appliance ("MonstraPro Box") that a customer
+buys, activates at monstra.pro, and which trades locally on their own
+Alpaca account — Monstra servers never touch trades or credentials.
+
+Work was split into two tracks:
+  Track A — the Python appliance software, in this repo (C:\dev\MonstraPro).
+  Track B — the monstra.pro website features, in the EXISTING production
+            Next.js app at C:\dev\NextJS_Monsta (not a new codebase — the
+            real monstra.bot site, since Pro Box owners share the same
+            accounts/bot registry/Alpaca connections as monstra.bot users).
+
+Both tracks were built, tested, and — where practical — verified against
+real running instances (not just unit tests).
+
+===============================================================================
+TRACK A — MonstraPro Box (Python, this repo)
+===============================================================================
+
+Five packages/services, 195 tests passing (0 failures) as of end of session:
+  packages/device_core      73 tests
+  packages/strategy_engine  38 tests
+  services/trading_worker   20 tests
+  services/display          29 tests
+  services/updater          35 tests (+2 skipped — Windows-only symlink
+                                       permission limits, not real deployment
+                                       target issues; real target is Linux)
+
+--- A1: packages/strategy_engine ---
+Ported the trading algorithms from Monstra-Worker, scoped to only the 3
+algorithm families a Pro Box runs: alpha1 ("Force"), aptet, draco.
+  - bot_identity.py, registry.py, signals.py — trimmed/adapted
+  - market_data/provider.py — Alpaca-primary/yfinance-fallback, unchanged
+    logic, dropped Monstra-Worker's Sentry/env_loader coupling
+  - bots/alpha1.py, bots/aptet.py, bots/draco.py (+draco_math.py,
+    draco_config.py) — all quant logic ported as-is; every run_<bot>()
+    changed from bot_id+DB-lookup to pure run_<bot>(config, state=None),
+    no DB access inside strategy_engine at all
+  - aptet now fetches prices through the shared Alpaca provider instead of
+    direct yfinance/Postgres calls (simpler, since Alpaca is primary here)
+  - draco's circuit breaker takes an optional equity_history list instead
+    of querying a live DB; state is returned in the result dict, not
+    written to a DB directly
+
+--- A2: services/trading_worker ---
+  - activation.py — ActivationClient protocol + LocalActivationClient
+    (reads device.activated_at from the local DB; swap in a real
+    HTTPActivationClient once Track B's status endpoint is wired up)
+  - alpaca_client.py — thin wrapper over alpaca-py
+  - rebalance.py — diffs target weights vs current Alpaca positions into a
+    sells-then-buys order plan
+  - loop.py — one trading cycle: run each active bot, persist signal/state,
+    submit orders on REBALANCE, emit events; one bot's failure doesn't
+    abort the others
+  - main.py — activation-gated loop wiring it together
+  - device_core additions needed to support this: order, bot_state,
+    account_snapshot tables + repositories (migration 0002)
+  - Added EventType.AWAITING_ACTIVATION (ARCHITECTURE.md named it, it was
+    missing from the enum)
+
+Known gap (documented in code comments, not yet fixed): which Alpaca
+credential row (paper vs live) is "active" has no real answer yet — main.py
+just prefers live-over-paper if both are connected.
+
+--- A3: services/display ---
+  - state.py — pure event-driven state machine: idle / awaiting_activation
+    / trade_wake, plus a connection banner (wifi/alpaca/update-available)
+    and a separate transient notification banner (added in A4 for
+    updater's manifest notifications)
+  - snapshot.py — builds the idle-screen data from device_core only, no
+    Alpaca dependency
+  - renderer.py (protocol) + pygame_renderer.py — actually rendered and
+    visually inspected via headless screenshots during development, which
+    caught two real bugs before shipping:
+      1. A timezone bug — SQLite strips tz info from stored datetimes, and
+         .astimezone() on a naive datetime silently assumes LOCAL time
+         instead of UTC. Fixed with an as_utc() normalizer + regression test.
+      2. A layout bug — the connection banner overlapped the header instead
+         of the layout reserving space for it.
+  - Deliberately did NOT implement per-trade win/loss (Objectives.txt asked
+    for it). Built an average-cost approximation first, proved it can
+    never report a loss by construction, and threw it out rather than ship
+    something misleading. recent_orders (symbol/side/notional/status) is
+    the honest stand-in; real per-trade P&L needs trading_worker to track
+    fill prices (not built).
+
+--- A4: services/updater ---
+  - manifest_client.py — ReleaseManifestClient protocol + NullManifestClient
+    stub (real endpoint now exists on the Track B side — see below — but no
+    Python HTTP client consumes it yet)
+  - signature.py — real Ed25519 signature verification via `cryptography`,
+    tested against self-generated keypairs. Public-key provisioning ("baked
+    into the base image") is out of scope — flagged, not faked.
+  - release_store.py — extract tar.gz -> atomic symlink swap -> prune-keep-3
+  - strategy_sync.py — applies manifest "algorithm universe updates" into
+    local strategy_config (only for bots sourced from monstra.pro) and
+    publishes NOTIFICATION events for display's banner
+  - main.py's run_once() — fetch -> sync -> compare versions -> verify
+    signature -> extract -> swap -> restart -> health-check-grace-period ->
+    rollback-on-failure. Every I/O edge (download, systemctl, sleep) is
+    injectable for testing.
+  - device_core addition: software_release table + repository (migration
+    0003)
+
+===============================================================================
+A CROSS-REPO INTEGRATION GAP FOUND (documented, not fixed)
+===============================================================================
+
+While building Track B's bot picker, discovered that each selectable "bot"
+on the website is actually a specific (monster identity, algorithm)
+variation, e.g. "bellitus_alpha1" or "vectura_draco" — not a bare algorithm
+family. But trading_worker's registry lookup only knows the 3 bare engine
+slugs (force/aptet/draco).
+
+Fix applied on the NextJS_Monsta side: DeviceBotSelection got a separate
+botType field (the engine) alongside botSlug (the specific instance
+identity), and both strategy-config/manifest endpoints surface it.
+
+NOT fixed on the Python side yet, because nothing real consumes this data
+end-to-end today (NullManifestClient never produces a manifest). Flagged
+with detailed comments in:
+  - services/updater/src/updater/manifest_client.py (module docstring)
+  - services/updater/src/updater/strategy_sync.py (module docstring)
+  - services/trading_worker/src/trading_worker/loop.py (module docstring)
+Whoever builds the real HTTPManifestClient needs to also fix loop.py to
+route via a stored engine field instead of assuming bot_slug IS the engine.
+
+===============================================================================
+TRACK B — monstra.pro website (C:\dev\NextJS_Monsta, the real production app)
+===============================================================================
+
+Built the device pairing + bot-selection + portfolio-preview flow described
+in Objectives.txt, on top of the EXISTING monstra.bot infrastructure
+(Clerk auth, Prisma DB, OFFICIAL_BOT_REGISTRY, Alpaca connections). 11 new
+test files, all passing (tsx-based tests, this codebase's own convention —
+no jest/vitest). Full typecheck clean (verified against the codebase's own
+pre-existing baseline of unrelated errors).
+
+--- B1: device pairing/activation domain ---
+Schema (prisma/schema.prisma + hand-written migration — NOT yet applied to
+any database; needs `npx prisma migrate deploy` run deliberately):
+  - Device model — serial, pairing code (15-min TTL, single-use), bearer
+    token (prefix+hash, mirrors the existing ApiKey pattern), userId
+    nullable until paired
+  - DeviceBotSelection model — botSlug (specific variation), botType
+    (engine), params (snapshotted from the registry at selection time)
+
+API routes (src/app/api/devices/):
+  - POST /register — unauthenticated, device self-registers, gets a token
+    + pairing code once. Refuses to reissue for an already-activated
+    device (a serial alone shouldn't be enough to hijack a device).
+  - POST /pair — Clerk-authenticated, owner submits the pairing code
+  - GET /status — device-token authenticated; what trading_worker's future
+    HTTPActivationClient will poll
+  - GET /strategy-config — bot selections + Alpaca connection status
+    (never credentials)
+  - GET /manifest — matches updater's ReleaseManifest contract; artifactUrl
+    stays null until a real signed-release pipeline exists
+Supporting: deviceAuth.ts (pure token/code helpers), authenticateDevice.ts
+(DB-backed auth, DI-testable), a new "device" rate-limit identity kind,
+all 4 device-token endpoints registered as public routes (NOT /pair, which
+stays Clerk-protected).
+
+--- B2: bot picker UI ---
+  - PUT/GET /api/devices/[deviceId]/bot-selection — Clerk-auth + ownership
+    checked. Client sends only variation slugs; server always resolves
+    botType/params authoritatively from OFFICIAL_BOT_REGISTRY (never
+    trusts client-submitted params).
+  - /dashboard/devices/[deviceId]/bots — the picker page: up to 10 bots,
+    selected ones pinned to top, "Details" opens in a new tab, force/aptet
+    /draco engines only (the 3 the Pro Box can run).
+
+--- B3: portfolio preview ---
+  - deviceBotPortfolioPreview.ts — blends selected bots' REAL current
+    holdings (reusing the same live data path monstra.bot already uses for
+    active subscriptions, via a newly-exported computeBlendedStockWeights),
+    sector diversity, and a risk/aggressiveness summary from each bot's
+    real editorial labels. Equal-weighted across bots (stated explicitly
+    in the UI, not left implicit).
+  - Deliberately does NOT show fabricated share quantities — a Pro Box's
+    actual holdings depend on strategy_engine re-running each cycle
+    against live prices, which nothing server-side can predict in advance.
+  - /dashboard/devices/[deviceId]/preview — stat tiles, sector bars, live
+    holdings table, back-to-edit / submit.
+
+--- Device management UI (closing the loop) ---
+  - /dashboard/devices — lists the user's paired Pro Boxes
+  - /dashboard/devices/pair — real form for entering a pairing code
+  - Not wired into the shared dashboard nav (DashboardSectionNav) — since
+    monstra.pro is meant to be its own domain/experience for Pro Box
+    owners (confirmed with the user), didn't want to presume monstra.bot's
+    own IA before that domain-routing work happens.
+
+--- Verified live, not just unit-tested ---
+Ran the actual dev server against the real dev database (Render Postgres)
+and clicked through the FULL flow in a real signed-in browser session:
+register a device -> pair it via the real form -> select bots (Bellitus
+force + Imperium aptet) -> land on the portfolio preview showing 6 real
+sectors, "High" dominant risk, and a live holdings table (VSAT, RTX, HII,
+JPM, XOM, AMZN, ANET, AVGO, BKNG, PLTR, LMT) pulled from real trading data.
+All test devices created during verification were deleted afterward.
+
+Note: Next 16 defaults to Turbopack for `next dev`, which was hard-crashing
+on this Windows machine during CSS compilation (unrelated to this code —
+crashed on the plain homepage too). Falling back to `next dev --webpack`
+worked cleanly. Worth knowing if local dev feels broken.
+
+===============================================================================
+WHAT'S EXPLICITLY NOT DONE
+===============================================================================
+
+- A5 — hardware bring-up on a real Raspberry Pi 5. Needs actual hardware.
+- monstra.pro domain routing — host-based branching in NextJS_Monsta's
+  proxy.ts so monstra.pro shows the Pro Box flow instead of monstra.bot's
+  homepage. Discussed, deliberately deferred.
+- B5 (full) — real signed software releases and authored notification
+  content (new-bot announcements, update-required messages). The manifest
+  endpoint is live with real strategyUpdates; there's no admin UI or
+  release-signing pipeline to produce the rest.
+- The cross-repo engine/bot_slug wiring gap above (Python side).
+- Real per-trade win/loss tracking on the device display (needs
+  trading_worker to poll Alpaca for fill prices — deliberately not faked).
+- Prisma migration for Track B's new tables (devices, device_bot_selections)
+  was WRITTEN but only applied to the dev database during verification
+  with explicit permission each time — confirm it's applied wherever this
+  gets deployed next (staging/production).
+
+===============================================================================
+HOUSEKEEPING NOTE
+===============================================================================
+
+Throughout this session, stray 0-byte files kept appearing across BOTH
+repos (and C:\dev itself) with names that look like fragments of code or
+JSON (e.g. "redirect", "{}", "MAX_SELECTED_BOTS)", "tuple[bool"). These were
+cleaned up repeatedly as found — root cause was never identified, but it's
+a recurring environment artifact worth keeping an eye on in future sessions.

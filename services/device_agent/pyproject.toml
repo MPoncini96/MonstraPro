@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "device_agent"
+version = "0.1.0"
+description = "Monstra.Pro Box device agent: first-boot Wi-Fi onboarding (temporary access point + local setup page + NetworkManager join)."
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[tool.setuptools.packages.find]
+where = ["src"]

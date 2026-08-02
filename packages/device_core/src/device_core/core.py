@@ -9,7 +9,7 @@
 
 DeviceCore.load() loads config, configures logging, opens the SQLite
 database (which runs pending Alembic migrations), builds the Vault, and
-wires up all seven repositories. Nothing else in the appliance should reach
+wires up all eleven repositories. Nothing else in the appliance should reach
 into device_core.db or device_core.repositories directly - DeviceCore is
 the boundary trading_worker/display/updater are expected to depend on.
 """
@@ -24,12 +24,19 @@ from device_core.config import Config, load_config
 from device_core.db.session import Database
 from device_core.logging import configure_logging
 from device_core.repositories import (
+    AccountSnapshotRepository,
+    BotStateRepository,
+    BotValueSnapshotRepository,
     CredentialRepository,
     DeviceEventRepository,
     DeviceRepository,
     ExecutionLogRepository,
+    ManualHoldingRepository,
+    OrderRepository,
     PortfolioAllocationRepository,
+    PositionSnapshotRepository,
     SignalRepository,
+    SoftwareReleaseRepository,
     StrategyConfigRepository,
 )
 from device_core.vault import Vault
@@ -46,6 +53,13 @@ class DeviceCore:
     signals: SignalRepository
     events: DeviceEventRepository
     logs: ExecutionLogRepository
+    orders: OrderRepository
+    bot_states: BotStateRepository
+    account_snapshots: AccountSnapshotRepository
+    positions: PositionSnapshotRepository
+    bot_values: BotValueSnapshotRepository
+    manual_holdings: ManualHoldingRepository
+    software_releases: SoftwareReleaseRepository
     vault: Vault
 
     @classmethod
@@ -65,6 +79,13 @@ class DeviceCore:
             signals=SignalRepository(database),
             events=DeviceEventRepository(database),
             logs=ExecutionLogRepository(database),
+            orders=OrderRepository(database),
+            bot_states=BotStateRepository(database),
+            account_snapshots=AccountSnapshotRepository(database),
+            positions=PositionSnapshotRepository(database),
+            bot_values=BotValueSnapshotRepository(database),
+            manual_holdings=ManualHoldingRepository(database),
+            software_releases=SoftwareReleaseRepository(database),
             vault=vault,
         )
 

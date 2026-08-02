@@ -1,0 +1,17 @@
+# Template for /etc/monstrapro/config.toml - device-level, non-secret
+# settings (device_core/src/device_core/config.py layer 2). Installed by
+# image/scripts/install.sh with --no-clobber, so re-running install on an
+# already-provisioned device never overwrites a device's live config.
+#
+# Secrets never belong in this file - device_core actively rejects any
+# alpaca/credential/api_key/api_secret-shaped key here at load time.
+
+log_level = "INFO"
+monstra_pro_api_url = "https://monstra.pro"
+event_poll_interval_seconds = 30
+
+# data_dir and release_dir are intentionally NOT set here - device_core's
+# built-in defaults already resolve to the correct split on Linux:
+#   data_dir    -> /var/lib/monstrapro   (persistent customer/device data)
+#   release_dir -> /opt/monstrapro       (replaceable application code)
+# Only override these for a non-standard install layout.

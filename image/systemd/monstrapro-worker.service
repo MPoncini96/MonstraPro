@@ -1,16 +1,20 @@
 [Unit]
 Description=Monstra.Pro Box trading worker
-After=network-online.target
+After=network-online.target monstrapro-firstboot.service monstrapro-lcd-setup.service
 Wants=network-online.target
+Requisite=monstrapro-firstboot.service
 
 [Service]
 Type=simple
 User=monstrapro
+Group=monstrapro
 WorkingDirectory=/opt/monstrapro/current
 ExecStart=/opt/monstrapro/current/services/trading_worker/.venv/bin/python -m trading_worker.main
 Restart=on-failure
 RestartSec=5
 EnvironmentFile=-/etc/monstrapro/env
+NoNewPrivileges=true
+ProtectHome=true
 
 [Install]
 WantedBy=multi-user.target
