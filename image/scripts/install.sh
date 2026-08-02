@@ -85,7 +85,14 @@ for service_dir in "$RELEASE_ROOT"/services/*/; do
         # not relative to wherever install.sh itself was invoked from. pip
         # resolves editable paths against its own CWD, not the requirements
         # file's location, so without this cd those lines fail to resolve.
-        ( cd "$service_dir" && run .venv/bin/pip install --quiet -r requirements.txt )
+        #
+        # The second install (-e .) installs the service's OWN package
+        # (services/X/pyproject.toml) into its venv - requirements.txt only
+        # ever lists its *dependencies* (device_core, strategy_engine, ...),
+        # never the service itself. Without this, `python -m X.main` fails
+        # with ModuleNotFoundError: No module named 'X' - caught live on
+        # real Pi 5 hardware, where every service hit this identically.
+        ( cd "$service_dir" && run .venv/bin/pip install --quiet -r requirements.txt && run .venv/bin/pip install --quiet -e . )
     fi
 done
 

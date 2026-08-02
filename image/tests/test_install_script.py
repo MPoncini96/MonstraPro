@@ -59,6 +59,19 @@ def test_install_script_vendors_lcd_show_only_if_not_already_present(scripts_dir
     assert 'if [ -d "$LCD_VENDOR_DIR" ]' in text
 
 
+def test_install_script_installs_the_service_package_itself_not_just_its_deps(scripts_dir):
+    """Regression guard for a real bug found on physical Pi 5 hardware:
+    each service's requirements.txt only lists its *dependencies*
+    (device_core, strategy_engine, ...), never the service's own package.
+    Without a separate `pip install -e .` from inside the service
+    directory, `python -m X.main` fails with
+    ModuleNotFoundError: No module named 'X' - hit identically by every
+    one of the five services the first time this was run for real."""
+    text = _text(scripts_dir, "install.sh")
+    assert "pip install --quiet -r requirements.txt" in text
+    assert "pip install --quiet -e ." in text
+
+
 def test_install_script_has_no_obviously_destructive_wildcard_removal(scripts_dir):
     text = _text(scripts_dir, "install.sh")
     assert "rm -rf /" not in text
