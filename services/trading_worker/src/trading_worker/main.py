@@ -4,8 +4,11 @@ Responsibilities (see ARCHITECTURE.md section 4.1):
 
   1. Load device_core.config, open the SQLite DB, run pending migrations.
   2. Own the activation state machine (see activation.py):
-       not activated -> emit `awaiting_activation` device_event, poll again
-                         after ACTIVATION_POLL_INTERVAL_SECONDS.
+       not activated -> emit `awaiting_activation` device_event on *every*
+                         poll (not just once - see _wait_for_activation's
+                         docstring for why a one-shot publish is fragile to
+                         a display restart), poll again after
+                         ACTIVATION_POLL_INTERVAL_SECONDS.
        activated     -> enter the trading loop.
   3. Trading loop, per scheduled cycle:
        reconcile_manual_holdings (manual_holdings.py) - buy up to each
@@ -38,12 +41,13 @@ from __future__ import annotations
 
 import logging
 import time
+from typing import Callable
 
 from device_core.core import DeviceCore
 from device_core.events import EventType
 from strategy_engine.market_data import provider as market_data_provider
 
-from trading_worker.activation import LocalActivationClient
+from trading_worker.activation import ActivationClient, ActivationStatus, LocalActivationClient
 from trading_worker.alpaca_client import AlpacaClient
 from trading_worker.loop import run_cycle
 from trading_worker.manual_holdings import reconcile_manual_holdings
@@ -137,20 +141,51 @@ def _record_snapshots(core: DeviceCore, alpaca: AlpacaClient) -> None:
         core.bot_values.record(bot_slug=bot_slug, value=weighted_price)
 
 
+def _wait_for_activation(
+    core: DeviceCore,
+    activation: ActivationClient,
+    *,
+    sleep: Callable[[float], None] = time.sleep,
+    poll_interval_seconds: float = ACTIVATION_POLL_INTERVAL_SECONDS,
+    max_polls: int | None = None,
+) -> ActivationStatus:
+    """Blocks (production: forever; tests: up to `max_polls`) until
+    activation.check_status().activated is True, re-publishing
+    `awaiting_activation` on every poll rather than once on entry.
+
+    Re-publishing matters because of how `display` derives its screen:
+    state.py's StateMachine only replays *unconsumed* device_event rows
+    (device_core.repositories.device_event.DeviceEventRepository.list_unconsumed),
+    and consumed_at is one global flag per event, not per-consumer - once
+    display consumes an event it is gone forever for every future consumer,
+    including a freshly-restarted display process. A one-shot publish here
+    means any restart of monstrapro-display.service after that single event
+    was already consumed - e.g. a routine restart while the device happens
+    to sit unactivated for a while - permanently drops the
+    awaiting_activation screen back to generic idle, with no way to recover
+    it short of restarting trading_worker itself. Caught live on real Pi 5
+    hardware: restarting display to test an unrelated fix silently lost the
+    activation screen for hours even though device.activated_at was null
+    the entire time.
+    """
+    status = activation.check_status()
+    polls = 0
+    while not status.activated:
+        core.events.publish(EventType.AWAITING_ACTIVATION, {"device_serial": status.device_serial})
+        logger.info("device not yet activated (serial=%s); waiting", status.device_serial)
+        polls += 1
+        if max_polls is not None and polls >= max_polls:
+            return status
+        sleep(poll_interval_seconds)
+        status = activation.check_status()
+    return status
+
+
 def main() -> None:
     core = DeviceCore.load()
     activation = LocalActivationClient(core)
 
-    status = activation.check_status()
-    if not status.activated:
-        # Published once on entry, not every poll iteration - `display`
-        # only needs one event to trigger its awaiting_activation screen,
-        # and it stays there until a different event supersedes it.
-        core.events.publish(EventType.AWAITING_ACTIVATION, {"device_serial": status.device_serial})
-        while not status.activated:
-            logger.info("device not yet activated (serial=%s); waiting", status.device_serial)
-            time.sleep(ACTIVATION_POLL_INTERVAL_SECONDS)
-            status = activation.check_status()
+    status = _wait_for_activation(core, activation)
 
     core.events.publish(EventType.DEVICE_ACTIVATED, {"owner_ref": status.owner_ref})
     _configure_market_data(core)

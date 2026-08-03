@@ -1,4 +1,5 @@
-from trading_worker.main import _record_snapshots
+from trading_worker.activation import ActivationStatus
+from trading_worker.main import _record_snapshots, _wait_for_activation
 
 
 class FakeAlpacaAccount:
@@ -132,3 +133,52 @@ def test_inactive_bots_are_not_recorded(core):
     ))
 
     assert core.bot_values.history("force") == []
+
+
+class _FakeActivationClient:
+    """Reports not-activated for the first `polls_until_activated` calls,
+    then activated - lets a test bound _wait_for_activation's loop by
+    reaching real activation rather than needing max_polls."""
+
+    def __init__(self, *, polls_until_activated: int, device_serial: str = "MPB-TEST"):
+        self._polls_until_activated = polls_until_activated
+        self._device_serial = device_serial
+        self.calls = 0
+
+    def check_status(self) -> ActivationStatus:
+        self.calls += 1
+        activated = self.calls > self._polls_until_activated
+        return ActivationStatus(activated=activated, device_serial=self._device_serial)
+
+
+def test_wait_for_activation_republishes_on_every_poll_not_just_once(core):
+    """Regression guard for a real bug found on physical Pi 5 hardware:
+    a one-shot publish (the old behavior) is invisible to any consumer
+    that starts *after* it was already consumed - display's screen state
+    is rebuilt purely by replaying unconsumed device_event rows, and
+    consumed_at is a single global flag, not per-consumer (see
+    device_core.repositories.device_event.DeviceEventRepository). A
+    routine restart of monstrapro-display.service while the device sits
+    unactivated silently and permanently dropped the awaiting_activation
+    screen back to generic idle. Republishing on every poll means any
+    display restart recovers within one poll interval."""
+    activation = _FakeActivationClient(polls_until_activated=3)
+    sleeps: list[float] = []
+
+    status = _wait_for_activation(core, activation, sleep=sleeps.append, poll_interval_seconds=5.0)
+
+    assert status.activated is True
+    assert len(sleeps) == 3  # slept once per not-yet-activated poll
+
+    events = core.events.list_unconsumed(limit=100)
+    awaiting_events = [e for e in events if e["type"] == "awaiting_activation"]
+    assert len(awaiting_events) == 3  # one per not-yet-activated poll, not just one
+
+
+def test_wait_for_activation_stops_at_max_polls_while_still_unactivated(core):
+    activation = _FakeActivationClient(polls_until_activated=100)
+
+    status = _wait_for_activation(core, activation, sleep=lambda _: None, max_polls=2)
+
+    assert status.activated is False
+    assert activation.calls == 2
