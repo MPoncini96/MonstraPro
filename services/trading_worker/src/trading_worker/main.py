@@ -13,7 +13,12 @@ Responsibilities (see ARCHITECTURE.md section 4.1):
                          a display restart), poll again after
                          ACTIVATION_POLL_INTERVAL_SECONDS.
        activated     -> enter the trading loop.
-  3. Trading loop, per scheduled cycle:
+  3. Once activated, _build_alpaca_client syncs Alpaca credentials from
+     monstra.pro on demand if none exist locally yet (alpaca_sync.py) -
+     the device-side half of the connect flow in NextJS_Monsta's
+     /devices/alpaca page. Only ever touches the network while local
+     credentials are missing; once synced, relies on its own local Vault.
+  4. Trading loop, per scheduled cycle:
        reconcile_manual_holdings (manual_holdings.py) - buy up to each
          locked individual stock's target_qty, never sell
        -> run_cycle (loop.py) - fetch market data -> run the owner's
@@ -59,6 +64,7 @@ from trading_worker.activation import (
     LocalActivationClient,
 )
 from trading_worker.alpaca_client import AlpacaClient
+from trading_worker.alpaca_sync import sync_alpaca_credentials_if_missing
 from trading_worker.loop import run_cycle
 from trading_worker.manual_holdings import reconcile_manual_holdings
 
@@ -96,6 +102,16 @@ def _configure_market_data(core: DeviceCore) -> None:
 
 def _build_alpaca_client(core: DeviceCore) -> AlpacaClient | None:
     credentials = _load_alpaca_credentials(core)
+    if credentials is None and sync_alpaca_credentials_if_missing(core):
+        # A fresh sync just populated the local Vault - reload, and also
+        # give _configure_market_data (only ever called once, right after
+        # activation, before this loop starts) a second chance now that
+        # credentials actually exist, rather than leaving market data
+        # permanently on its yfinance fallback for the rest of this
+        # process's lifetime.
+        credentials = _load_alpaca_credentials(core)
+        if credentials is not None:
+            _configure_market_data(core)
     if credentials is None:
         return None
     return AlpacaClient(
