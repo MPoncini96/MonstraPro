@@ -19,7 +19,7 @@ def test_defaults_create_data_dir_and_release_dir(tmp_path):
     assert config.release_dir.exists()
     assert config.encryption_key_path == config.data_dir / "device.key"
     assert config.sqlite_url == f"sqlite:///{(config.data_dir / 'monstrapro.db').as_posix()}"
-    assert config.monstra_pro_api_url == "https://monstra.pro"
+    assert config.monstra_pro_api_url == "https://www.monstra.pro"
     assert config.log_level == "INFO"
     assert config.event_poll_interval_seconds == 30
 

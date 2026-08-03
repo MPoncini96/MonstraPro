@@ -135,7 +135,14 @@ def load_config(overrides: Mapping[str, Any] | None = None) -> Config:
                 f"log_level must be one of {sorted(_VALID_LOG_LEVELS)}, got {log_level!r}"
             )
 
-        monstra_pro_api_url = str(values.get("monstra_pro_api_url", "https://monstra.pro"))
+        # www.monstra.pro, not the naked domain: monstra.pro 308-redirects to
+        # www.monstra.pro, and `requests` (trading_worker.activation.
+        # HTTPActivationClient) strips the Authorization header on a
+        # cross-host redirect - hitting the naked domain silently turns
+        # every authenticated call into an anonymous one, which surfaces as
+        # a confusing 401 rather than an obvious redirect problem. Caught
+        # live against the real API on Pi 5 hardware.
+        monstra_pro_api_url = str(values.get("monstra_pro_api_url", "https://www.monstra.pro"))
         if not monstra_pro_api_url.startswith(("http://", "https://")):
             raise ConfigError(
                 f"monstra_pro_api_url must be an http(s) URL, got {monstra_pro_api_url!r}"
