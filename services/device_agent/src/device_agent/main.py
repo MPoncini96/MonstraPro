@@ -48,6 +48,22 @@ def main() -> None:
     device = core.devices.get_or_create()
     network = _build_network_manager()
 
+    # Checked here, before ever touching port 80 - not just left to
+    # run_onboarding's own identical check. Caught live on real Pi 5
+    # hardware: the old code unconditionally constructed+started SetupServer
+    # first no matter what, so on any boot/restart where has_usable_connection()
+    # happened to be momentarily false (e.g. a NetworkManager race at boot),
+    # this process would go into AP mode and hold port 80 indefinitely
+    # waiting for Wi-Fi credentials nobody would ever submit (the device
+    # already had working Wi-Fi) - permanently blocking
+    # monstrapro-portfolio-web.service, which also binds port 80, from ever
+    # starting. Checking first means the common "already connected" case
+    # never touches port 80 at all, matching this module's own docstring:
+    # "run_onboarding is a fast no-op and this process just idles/exits".
+    if network.has_usable_connection():
+        logger.info("usable Wi-Fi connection already present; skipping onboarding")
+        return
+
     setup_server = SetupServer(network, port=SETUP_SERVER_PORT)
     setup_server.start()
     try:
