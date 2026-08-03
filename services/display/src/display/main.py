@@ -100,7 +100,7 @@ def main() -> None:
             if machine.screen == ScreenState.WIFI_SETUP:
                 renderer.render_wifi_setup(machine.ap_ssid, machine.setup_url, machine.top_banner)
             elif machine.screen == ScreenState.AWAITING_ACTIVATION:
-                renderer.render_awaiting_activation(machine.device_serial, machine.top_banner)
+                renderer.render_awaiting_activation(machine.device_serial, machine.pairing_code, machine.top_banner)
             elif machine.screen == ScreenState.TRADE_WAKE:
                 snapshot = build_snapshot(core, now=now)
                 renderer.render_trade_wake(snapshot, machine.top_banner)

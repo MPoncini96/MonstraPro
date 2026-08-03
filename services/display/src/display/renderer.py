@@ -42,7 +42,14 @@ class Renderer(Protocol):
 
     def render_wifi_setup(self, ap_ssid: str | None, setup_url: str | None, banner: str | None) -> None: ...
 
-    def render_awaiting_activation(self, device_serial: str | None, banner: str | None) -> None: ...
+    def render_awaiting_activation(
+        self, device_serial: str | None, pairing_code: str | None, banner: str | None
+    ) -> None:
+        """pairing_code is what the owner types into monstra.pro's
+        /dashboard/devices/pair; device_serial is shown only as a small
+        reference line (see trading_worker.activation.HTTPActivationClient
+        for where pairing_code comes from)."""
+        ...
 
     def render_trade_wake(self, snapshot: DisplaySnapshot, banner: str | None) -> None: ...
 

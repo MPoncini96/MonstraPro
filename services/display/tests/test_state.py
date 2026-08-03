@@ -28,6 +28,19 @@ def test_awaiting_activation_event_switches_screen_and_captures_serial():
     assert machine.device_serial == "MPB-ABC123"
 
 
+def test_awaiting_activation_event_captures_pairing_code():
+    """pairing_code (from trading_worker.activation.HTTPActivationClient) is
+    what the owner actually types into monstra.pro's /dashboard/devices/pair -
+    it must flow through the same event as device_serial."""
+    machine = StateMachine()
+    machine = machine.advance(
+        [_event("awaiting_activation", {"device_serial": "MPB-ABC123", "pairing_code": "WXYZ7890"})],
+        now=_NOW,
+    )
+
+    assert machine.pairing_code == "WXYZ7890"
+
+
 def test_device_activated_returns_to_idle_from_awaiting_activation():
     machine = StateMachine(screen=ScreenState.AWAITING_ACTIVATION, device_serial="MPB-ABC123")
     machine = machine.advance([_event("device_activated")], now=_NOW)

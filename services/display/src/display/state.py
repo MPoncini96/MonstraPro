@@ -80,6 +80,7 @@ class StateMachine:
     screen: ScreenState = ScreenState.IDLE
     banner: str | None = None
     device_serial: str | None = None
+    pairing_code: str | None = None
     ap_ssid: str | None = None
     setup_url: str | None = None
     recent_trades: list[dict[str, Any]] = field(default_factory=list)
@@ -103,6 +104,7 @@ class StateMachine:
         screen = self.screen
         banner = self.banner
         device_serial = self.device_serial
+        pairing_code = self.pairing_code
         ap_ssid = self.ap_ssid
         setup_url = self.setup_url
         recent_trades = list(self.recent_trades)
@@ -132,6 +134,7 @@ class StateMachine:
             elif event_type == "awaiting_activation":
                 screen = ScreenState.AWAITING_ACTIVATION
                 device_serial = payload.get("device_serial", device_serial)
+                pairing_code = payload.get("pairing_code", pairing_code)
             elif event_type == "device_activated":
                 if screen == ScreenState.AWAITING_ACTIVATION:
                     screen = ScreenState.IDLE
@@ -154,6 +157,7 @@ class StateMachine:
             screen=screen,
             banner=banner,
             device_serial=device_serial,
+            pairing_code=pairing_code,
             ap_ssid=ap_ssid,
             setup_url=setup_url,
             recent_trades=recent_trades,

@@ -209,7 +209,9 @@ class PygameRenderer:
         self._draw_banner(screen, banner)
         self._present()
 
-    def render_awaiting_activation(self, device_serial: str | None, banner: str | None) -> None:
+    def render_awaiting_activation(
+        self, device_serial: str | None, pairing_code: str | None, banner: str | None
+    ) -> None:
         screen = self._require_screen()
         screen.fill(_BG)
         width, height = self._size
@@ -217,12 +219,22 @@ class PygameRenderer:
         title = self._font_large.render("Activate this device", True, _FG)
         screen.blit(title, title.get_rect(center=(width // 2, height // 2 - 60)))
 
-        subtitle = self._font_medium.render("at monstra.pro", True, _MUTED)
+        subtitle = self._font_medium.render("Enter this code at monstra.pro", True, _MUTED)
         screen.blit(subtitle, subtitle.get_rect(center=(width // 2, height // 2 - 15)))
 
-        code_text = device_serial or "..."
+        # pairing_code is what actually goes into /dashboard/devices/pair -
+        # device_serial is shown only as a small reference line underneath
+        # (support calls, not something the owner ever types in). "..." is
+        # this screen's existing placeholder for "not available yet" (see
+        # render_wifi_setup's identical ap_ssid fallback) - covers the brief
+        # window before HTTPActivationClient's first successful registration.
+        code_text = pairing_code or "..."
         code = self._font_large.render(code_text, True, _ACCENT)
         screen.blit(code, code.get_rect(center=(width // 2, height // 2 + 50)))
+
+        if device_serial:
+            serial_text = self._font_small.render(device_serial, True, _MUTED)
+            screen.blit(serial_text, serial_text.get_rect(center=(width // 2, height // 2 + 95)))
 
         self._draw_banner(screen, banner)
         self._present()
