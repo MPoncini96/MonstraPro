@@ -9,6 +9,7 @@ description = "Monstra.Pro Box trading_worker service: activation state machine,
 requires-python = ">=3.11"
 dependencies = [
     "alpaca-py>=0.30",
+    "requests",
 ]
 
 [project.optional-dependencies]

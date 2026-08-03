@@ -1,3 +1,4 @@
 -e ../../packages/strategy_engine
 -e ../../packages/device_core
 alpaca-py
+requests

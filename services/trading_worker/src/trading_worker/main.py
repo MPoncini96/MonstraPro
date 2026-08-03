@@ -3,7 +3,10 @@
 Responsibilities (see ARCHITECTURE.md section 4.1):
 
   1. Load device_core.config, open the SQLite DB, run pending migrations.
-  2. Own the activation state machine (see activation.py):
+  2. Own the activation state machine (see activation.py): on real hardware,
+     HTTPActivationClient registers with and polls monstra.pro's device API
+     (_build_activation_client); LocalActivationClient (local DB only) is
+     used for offline/simulated dev and tests.
        not activated -> emit `awaiting_activation` device_event on *every*
                          poll (not just once - see _wait_for_activation's
                          docstring for why a one-shot publish is fragile to
@@ -40,6 +43,8 @@ device_core.db.models.BotValueSnapshot's docstring for why.
 from __future__ import annotations
 
 import logging
+import os
+import platform
 import time
 from typing import Callable
 
@@ -47,7 +52,12 @@ from device_core.core import DeviceCore
 from device_core.events import EventType
 from strategy_engine.market_data import provider as market_data_provider
 
-from trading_worker.activation import ActivationClient, ActivationStatus, LocalActivationClient
+from trading_worker.activation import (
+    ActivationClient,
+    ActivationStatus,
+    HTTPActivationClient,
+    LocalActivationClient,
+)
 from trading_worker.alpaca_client import AlpacaClient
 from trading_worker.loop import run_cycle
 from trading_worker.manual_holdings import reconcile_manual_holdings
@@ -57,6 +67,16 @@ logger = logging.getLogger(__name__)
 ACTIVATION_POLL_INTERVAL_SECONDS = 60
 ACCOUNT_SNAPSHOT_INTERVAL_SECONDS = 60
 TRADING_CYCLE_INTERVAL_SECONDS = 300
+
+
+def _build_activation_client(core: DeviceCore) -> ActivationClient:
+    """Same Linux-real/non-Linux-simulated split as
+    device_agent.main._build_network_manager, for the same reason: never let
+    a dev machine's test run make a real HTTP call to monstra.pro."""
+    if platform.system() == "Linux" and os.environ.get("TRADING_WORKER_SIMULATE_ACTIVATION") != "1":
+        return HTTPActivationClient(core)
+    logger.warning("using LocalActivationClient (non-Linux host or TRADING_WORKER_SIMULATE_ACTIVATION=1)")
+    return LocalActivationClient(core)
 
 
 def _load_alpaca_credentials(core: DeviceCore) -> dict[str, str] | None:
@@ -171,7 +191,10 @@ def _wait_for_activation(
     status = activation.check_status()
     polls = 0
     while not status.activated:
-        core.events.publish(EventType.AWAITING_ACTIVATION, {"device_serial": status.device_serial})
+        core.events.publish(
+            EventType.AWAITING_ACTIVATION,
+            {"device_serial": status.device_serial, "pairing_code": status.pairing_code},
+        )
         logger.info("device not yet activated (serial=%s); waiting", status.device_serial)
         polls += 1
         if max_polls is not None and polls >= max_polls:
@@ -183,7 +206,7 @@ def _wait_for_activation(
 
 def main() -> None:
     core = DeviceCore.load()
-    activation = LocalActivationClient(core)
+    activation = _build_activation_client(core)
 
     status = _wait_for_activation(core, activation)
 
