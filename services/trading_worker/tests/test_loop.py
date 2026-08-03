@@ -4,7 +4,7 @@ import pytest
 
 import trading_worker.loop as loop_module
 from trading_worker.alpaca_client import AccountSnapshot, OrderResult
-from trading_worker.loop import run_cycle
+from trading_worker.loop import NETTED_ORDER_BOT_SLUG, run_cycle
 
 
 class FakeAlpacaClient:
@@ -49,10 +49,13 @@ def test_rebalance_signal_submits_orders_and_persists(core, monkeypatch):
 
     results = run_cycle(core, alpaca)
 
-    assert results == [{"bot_slug": "force", "signal": "REBALANCE", "orders": [{"symbol": "AAPL", "side": "buy", "notional": 1000.0}]}]
+    assert results == [{"bot_slug": "force", "signal": "REBALANCE", "desired_weights": {"AAPL": 1.0}}]
     assert alpaca.submitted_orders == [{"symbol": "AAPL", "side": "buy", "qty": None, "notional": 1000.0}]
 
-    orders = core.orders.recent(bot_slug="force")
+    # Recorded under the synthetic netted-order slug, not the originating
+    # bot's own slug - see loop.py's module docstring on why per-bot order
+    # attribution is dropped once orders can combine multiple bots' trades.
+    orders = core.orders.recent(bot_slug=NETTED_ORDER_BOT_SLUG)
     assert len(orders) == 1
     assert orders[0]["symbol"] == "AAPL"
     assert orders[0]["status"] == "accepted"
@@ -75,9 +78,9 @@ def test_hold_signal_submits_no_orders(core, monkeypatch):
 
     results = run_cycle(core, alpaca)
 
-    assert results == [{"bot_slug": "force", "signal": "HOLD", "orders": []}]
+    assert results == [{"bot_slug": "force", "signal": "HOLD", "desired_weights": None}]
     assert alpaca.submitted_orders == []
-    assert core.orders.recent(bot_slug="force") == []
+    assert core.orders.recent(bot_slug=NETTED_ORDER_BOT_SLUG) == []
     assert core.allocations.latest("force") is None
     event_types = [e["type"] for e in core.events.list_unconsumed()]
     assert "trade_executed" not in event_types
@@ -178,7 +181,7 @@ def test_all_target_symbols_locked_skips_rebalance_entirely(core, monkeypatch):
 
     results = run_cycle(core, alpaca)
 
-    assert results == [{"bot_slug": "force", "signal": "REBALANCE", "orders": []}]
+    assert results == [{"bot_slug": "force", "signal": "REBALANCE", "desired_weights": None}]
     assert alpaca.submitted_orders == []
     assert core.allocations.latest("force") is None
 
@@ -194,7 +197,7 @@ def test_runner_lookup_uses_bot_type_not_bot_slug_when_present(core, monkeypatch
 
     results = run_cycle(core, alpaca)
 
-    assert results == [{"bot_slug": "vectura_draco", "signal": "HOLD", "orders": []}]
+    assert results == [{"bot_slug": "vectura_draco", "signal": "HOLD", "desired_weights": None}]
 
 
 def test_runner_lookup_falls_back_to_bot_slug_when_bot_type_is_none(core, monkeypatch):
@@ -206,7 +209,7 @@ def test_runner_lookup_falls_back_to_bot_slug_when_bot_type_is_none(core, monkey
 
     results = run_cycle(core, alpaca)
 
-    assert results == [{"bot_slug": "force", "signal": "HOLD", "orders": []}]
+    assert results == [{"bot_slug": "force", "signal": "HOLD", "desired_weights": None}]
 
 
 def test_locked_value_is_excluded_from_manageable_equity(core, monkeypatch):
@@ -222,3 +225,133 @@ def test_locked_value_is_excluded_from_manageable_equity(core, monkeypatch):
     [order] = alpaca.submitted_orders
     assert order["symbol"] == "AAPL"
     assert order["notional"] == pytest.approx(600.0)
+
+
+# --- Cross-bot equity weighting + netting ----------------------------------
+
+
+def test_all_bots_default_to_equal_weight_when_unset(core, monkeypatch):
+    """Today's exact live scenario: several bots selected on monstra.pro
+    with no equity_weight configured at all must split the account evenly,
+    not each assume 100%."""
+    core.strategies.upsert(bot_slug="force", params={})
+    core.strategies.upsert(bot_slug="aptet", params={})
+    _patch_registry(
+        monkeypatch,
+        {
+            "force": lambda config, state: _signal("force", signal="REBALANCE", target_weights={"AAPL": 1.0}),
+            "aptet": lambda config, state: _signal("aptet", signal="REBALANCE", target_weights={"MSFT": 1.0}),
+        },
+    )
+    alpaca = FakeAlpacaClient(equity=1000.0, position_values={})
+
+    run_cycle(core, alpaca)
+
+    orders_by_symbol = {o["symbol"]: o for o in alpaca.submitted_orders}
+    assert orders_by_symbol["AAPL"]["notional"] == pytest.approx(500.0)
+    assert orders_by_symbol["MSFT"]["notional"] == pytest.approx(500.0)
+
+
+def test_bots_with_different_equity_weights_split_proportionally(core, monkeypatch):
+    core.strategies.upsert(bot_slug="force", equity_weight=3.0, params={})
+    core.strategies.upsert(bot_slug="aptet", equity_weight=1.0, params={})
+    _patch_registry(
+        monkeypatch,
+        {
+            "force": lambda config, state: _signal("force", signal="REBALANCE", target_weights={"AAPL": 1.0}),
+            "aptet": lambda config, state: _signal("aptet", signal="REBALANCE", target_weights={"MSFT": 1.0}),
+        },
+    )
+    alpaca = FakeAlpacaClient(equity=1000.0, position_values={})
+
+    run_cycle(core, alpaca)
+
+    orders_by_symbol = {o["symbol"]: o for o in alpaca.submitted_orders}
+    assert orders_by_symbol["AAPL"]["notional"] == pytest.approx(750.0)
+    assert orders_by_symbol["MSFT"]["notional"] == pytest.approx(250.0)
+
+
+def test_overlapping_bots_produce_one_net_order_instead_of_colliding(core, monkeypatch):
+    """The actual regression test for the live bug: two bots both want to
+    exit the same already-held symbol in the same cycle. Under the old
+    per-bot-submits-independently code, each bot would have computed its
+    OWN full-exit sell order against the SAME shared position, and only the
+    first submission would succeed - the second would hit Alpaca's real
+    qty check and fail with "insufficient qty available" (exactly what
+    happened live with 5 bots and a shared ERX position). Netting must
+    produce exactly ONE sell order for the correct combined amount."""
+    core.strategies.upsert(bot_slug="force", params={})
+    core.strategies.upsert(bot_slug="aptet", params={})
+    _patch_registry(
+        monkeypatch,
+        {
+            "force": lambda config, state: _signal("force", signal="REBALANCE", target_weights={"AAPL": 1.0}),
+            "aptet": lambda config, state: _signal("aptet", signal="REBALANCE", target_weights={"MSFT": 1.0}),
+        },
+    )
+    # Neither bot's target includes ERX - both independently want out of it.
+    alpaca = FakeAlpacaClient(equity=1000.0, position_values={"ERX": 300.0})
+
+    run_cycle(core, alpaca)
+
+    erx_orders = [o for o in alpaca.submitted_orders if o["symbol"] == "ERX"]
+    assert len(erx_orders) == 1
+    assert erx_orders[0]["side"] == "sell"
+    assert erx_orders[0]["notional"] == pytest.approx(300.0)
+
+
+def test_hold_bots_carried_forward_allocation_is_reexcluded_against_a_newly_locked_symbol(core, monkeypatch):
+    """A symbol can be locked (services/portfolio_web) after a bot's last
+    real REBALANCE - its carried-forward allocation (from
+    core.allocations.latest) must be re-run through exclude_locked_symbols
+    against THIS cycle's locks, not just whatever was true when it was
+    originally written, or a stale allocation could reintroduce a
+    now-locked symbol into the combined pool."""
+    core.strategies.upsert(bot_slug="force", params={})
+    core.allocations.replace(bot_slug="force", target_weights={"AAPL": 0.5, "TSLA": 0.5}, current_weights={})
+    core.manual_holdings.add(symbol="TSLA", target_qty=5.0)  # locked AFTER that allocation was written
+    _patch_registry(monkeypatch, {"force": lambda config, state: _signal("force", signal="HOLD")})
+    alpaca = FakeAlpacaClient(equity=1000.0, position_values={})
+
+    run_cycle(core, alpaca)
+
+    assert not any(o["symbol"] == "TSLA" for o in alpaca.submitted_orders)
+    [order] = alpaca.submitted_orders
+    assert order["symbol"] == "AAPL"
+    assert order["notional"] == pytest.approx(1000.0)  # TSLA dropped, AAPL renormalized to 100%
+
+
+def test_locked_symbol_excluded_from_combined_pool_even_if_only_one_bot_targets_it(core, monkeypatch):
+    core.manual_holdings.add(symbol="TSLA", target_qty=5.0)
+    core.strategies.upsert(bot_slug="force", params={})
+    core.strategies.upsert(bot_slug="aptet", params={})
+    _patch_registry(
+        monkeypatch,
+        {
+            "force": lambda config, state: _signal("force", signal="REBALANCE", target_weights={"AAPL": 0.5, "TSLA": 0.5}),
+            "aptet": lambda config, state: _signal("aptet", signal="REBALANCE", target_weights={"MSFT": 1.0}),
+        },
+    )
+    alpaca = FakeAlpacaClient(equity=1000.0, position_values={})
+
+    run_cycle(core, alpaca)
+
+    assert not any(o["symbol"] == "TSLA" for o in alpaca.submitted_orders)
+
+
+def test_failed_bot_falls_back_to_last_known_allocation_instead_of_forcing_a_sale(core, monkeypatch):
+    """A transient strategy-engine error must not force-sell whatever the
+    bot was previously holding - it should carry forward its last known
+    allocation, same as a HOLD signal would."""
+    core.strategies.upsert(bot_slug="force", params={})
+    core.allocations.replace(bot_slug="force", target_weights={"AAPL": 1.0}, current_weights={})
+
+    def failing_runner(config, state):
+        raise RuntimeError("boom")
+
+    _patch_registry(monkeypatch, {"force": failing_runner})
+    alpaca = FakeAlpacaClient(equity=1000.0, position_values={"AAPL": 1000.0})
+
+    run_cycle(core, alpaca)
+
+    assert alpaca.submitted_orders == []  # already at its last known target - nothing to trade

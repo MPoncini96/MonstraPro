@@ -72,6 +72,7 @@ def sync_bot_selections(core: DeviceCore, *, timeout_seconds: float = 10.0, sess
         core.strategies.upsert(
             bot_slug=bot_slug,
             bot_type=bot_type,
+            equity_weight=bot.get("equityWeight"),
             display_name=(existing or {}).get("display_name") or bot_slug,
             params=bot.get("params") or {},
             target_allocation=(existing or {}).get("target_allocation_json"),
@@ -87,6 +88,7 @@ def sync_bot_selections(core: DeviceCore, *, timeout_seconds: float = 10.0, sess
             core.strategies.upsert(
                 bot_slug=row["bot_slug"],
                 bot_type=row.get("bot_type"),
+                equity_weight=row.get("equity_weight"),
                 display_name=row.get("display_name"),
                 params=row.get("params_json") or {},
                 target_allocation=row.get("target_allocation_json"),

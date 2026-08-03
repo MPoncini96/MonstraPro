@@ -455,8 +455,14 @@ service.
   registry pattern from `algorithm_registry.py` is the plan, not yet coded).
 - Full OS image A/B updates (application-level release-directory updates are
   the V1 mechanism).
-- Multi-strategy portfolio blending beyond what a single owner's configured
-  bot(s) produce.
+- True per-bot order attribution once multiple bots' trades are netted
+  together (a virtual per-bot sub-account ledger, so a combined order could
+  be split back into per-bot trade history) - basic equity-weighted netting
+  itself IS implemented (trading_worker/loop.py: each active bot gets a
+  configurable relative share of the account, and overlapping bot trades on
+  the same symbol combine into one net order instead of racing each other),
+  but a netted order is recorded under a synthetic bot_slug rather than
+  attributed back to the contributing bots.
 - Optional anonymized telemetry back to Monstra (the API boundary is left
   open for this, but nothing sends yet).
 - A real, buildable Raspberry Pi OS image (`.img` file). `image/` provides

@@ -82,6 +82,45 @@ def test_creates_new_local_rows_for_each_selected_bot(core):
     assert draco_row["source"] == "monstra.pro"
 
 
+def test_syncs_equity_weight_from_the_website(core):
+    _register(core)
+    session = _FakeSession(
+        get_response=_FakeResponse(
+            200,
+            {"bots": [{"botSlug": "vectura_draco", "botType": "draco", "params": {}, "equityWeight": 2.5}]},
+        )
+    )
+
+    sync_bot_selections(core, session=session)
+
+    assert core.strategies.get("vectura_draco")["equity_weight"] == 2.5
+
+
+def test_missing_equity_weight_syncs_as_none(core):
+    _register(core)
+    session = _FakeSession(
+        get_response=_FakeResponse(200, {"bots": [{"botSlug": "vectura_draco", "botType": "draco", "params": {}}]})
+    )
+
+    sync_bot_selections(core, session=session)
+
+    assert core.strategies.get("vectura_draco")["equity_weight"] is None
+
+
+def test_deactivation_preserves_the_bots_existing_equity_weight(core):
+    _register(core)
+    core.strategies.upsert(
+        bot_slug="vectura_draco", bot_type="draco", equity_weight=3.0, is_active=True, source="monstra.pro"
+    )
+    session = _FakeSession(get_response=_FakeResponse(200, {"bots": []}))
+
+    sync_bot_selections(core, session=session)
+
+    row = core.strategies.get("vectura_draco")
+    assert row["is_active"] is False
+    assert row["equity_weight"] == 3.0
+
+
 def test_deactivates_a_previously_synced_bot_no_longer_selected(core):
     _register(core)
     core.strategies.upsert(bot_slug="vectura_draco", bot_type="draco", is_active=True, source="monstra.pro")

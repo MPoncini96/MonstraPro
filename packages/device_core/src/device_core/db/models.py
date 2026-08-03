@@ -131,6 +131,13 @@ class StrategyConfig(Base):
     # looks up get_algorithm()/get_runner() by this field (falling back to
     # bot_slug when None, for rows never synced from monstra.pro).
     bot_type: Mapped[str | None] = mapped_column(String(32))
+    # This bot's relative share of the account (any positive float; None is
+    # treated as 1.0 - equal footing with any other unweighted bot) when
+    # trading_worker/loop.py nets multiple active bots' trades together each
+    # cycle instead of letting each assume it owns the whole account. Set
+    # from monstra.pro's DeviceBotSelection.equityWeight via
+    # bot_selection_sync.py.
+    equity_weight: Mapped[float | None] = mapped_column(Float)
     display_name: Mapped[str | None] = mapped_column(String(128))
     params_json: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     target_allocation_json: Mapped[dict[str, Any] | None] = mapped_column(JSON)

@@ -54,6 +54,24 @@ def test_bot_type_defaults_to_none_for_locally_seeded_rows(config):
     assert repo.get("force")["bot_type"] is None
 
 
+def test_equity_weight_round_trips(config):
+    db = Database(config)
+    repo = StrategyConfigRepository(db)
+
+    repo.upsert(bot_slug="vectura_draco", bot_type="draco", equity_weight=2.5, source="monstra.pro")
+
+    assert repo.get("vectura_draco")["equity_weight"] == 2.5
+
+
+def test_equity_weight_defaults_to_none_when_unset(config):
+    db = Database(config)
+    repo = StrategyConfigRepository(db)
+
+    repo.upsert(bot_slug="force")
+
+    assert repo.get("force")["equity_weight"] is None
+
+
 def test_list_by_source_filters_correctly(config):
     db = Database(config)
     repo = StrategyConfigRepository(db)
