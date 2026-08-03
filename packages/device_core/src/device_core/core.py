@@ -72,7 +72,7 @@ class DeviceCore:
         return cls(
             config=config,
             database=database,
-            devices=DeviceRepository(database),
+            devices=DeviceRepository(database, vault),
             credentials=CredentialRepository(database, vault),
             strategies=StrategyConfigRepository(database),
             allocations=PortfolioAllocationRepository(database),

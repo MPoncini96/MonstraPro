@@ -22,6 +22,14 @@ first-boot-only setup page) that lets the owner toggle bots on/off and add
 individually-held, locked-quantity stocks - see manual_holding's own
 docstring and trading_worker/manual_holdings.py.
 
+Phase 6 (migration 0006, monstra.pro device pairing): `device.pairing_code`,
+`device.pairing_code_expires_at`, `device.device_token_encrypted`. Backs
+trading_worker's real HTTPActivationClient (replacing LocalActivationClient)
+against monstra.pro's already-built `/api/devices/register` +
+`/api/devices/pair` + `/api/devices/status` - see
+device_core.repositories.device.DeviceRepository.store_registration's
+docstring for the full protocol.
+
 Schema is created/evolved exclusively through Alembic migrations
 (db/migrations/versions/) - this module defines the mapped classes that
 migration 0001 mirrors by hand; nothing here calls create_all() in
@@ -78,6 +86,16 @@ class Device(Base):
     disclosures_accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     software_version: Mapped[str | None] = mapped_column(String(32))
     local_pin: Mapped[str | None] = mapped_column(String(16))
+    # pairing_code is plaintext for the same reason local_pin is (see above):
+    # it must be displayable on the LCD for the owner to read and type into
+    # monstra.pro's /dashboard/devices/pair. device_token_encrypted is the
+    # opposite case - it's this device's own bearer credential for calling
+    # monstra.pro's device API (Authorization: Bearer <token>), never shown
+    # anywhere, so it's Vault-encrypted at rest exactly like Alpaca
+    # credentials (see vault.py, repositories/credentials.py).
+    pairing_code: Mapped[str | None] = mapped_column(String(16))
+    pairing_code_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    device_token_encrypted: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
