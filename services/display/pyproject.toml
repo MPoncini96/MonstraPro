@@ -9,6 +9,7 @@ description = "Monstra.Pro Box display service: always-on status renderer + even
 requires-python = ">=3.11"
 dependencies = [
     "pygame-ce>=2.5",
+    "numpy",
 ]
 
 [project.optional-dependencies]

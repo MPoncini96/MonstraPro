@@ -3,34 +3,46 @@
 Video driver selection is left to SDL's own `SDL_VIDEODRIVER` environment
 variable rather than hardcoded here: unset (or "windib"/"x11"/"cocoa") gives
 a normal desktop window, which is how this was actually run and visually
-checked during development on Windows — `SDL_VIDEODRIVER=kmsdrm` is what
-deploy/systemd's EnvironmentFile sets on the real device for direct
-framebuffer/DRM output. Same code path either way.
+checked during development on Windows.
 
-Screen resolution is a constructor argument, not a hardware constant — the
-target display's actual size isn't chosen yet (see ARCHITECTURE.md: "V1
-design"), so this defaults to a size that's easy to eyeball in a dev
-window rather than a guessed hardware panel size.
+The real device is a different story, confirmed on actual Pi 5 hardware:
+this panel (goodtft/MHS35) has no /dev/dri at all, so `SDL_VIDEODRIVER=kmsdrm`
+- the original plan, referenced by the now-deleted deploy/systemd's
+EnvironmentFile - can never work here. Every real SDL video driver probed as
+"not available" (no DRM device, no X/Wayland compositor); only the invisible
+`dummy`/`offscreen` ones succeed. `/etc/monstrapro/env` (image/scripts/install.sh)
+instead sets `SDL_VIDEODRIVER=dummy` plus `MONSTRAPRO_FB_DEVICE=/dev/fb0` -
+pygame renders normally off-screen, and this class hands the finished frame
+to display.framebuffer.FramebufferWriter, which mmaps /dev/fb0 and writes
+the real pixels there directly. See framebuffer.py's module docstring.
+
+Screen resolution is a constructor argument, not a hardware constant. When
+MONSTRAPRO_FB_DEVICE is set and no explicit size was passed in, it's
+auto-detected from the framebuffer's own /sys/class/graphics/fb0/virtual_size
+rather than assumed - confirmed on real hardware to be 480x320, not the
+800x480 dev-window default below (see "What remains" in image/README.md for
+the layout-tightness consequence of that gap, not addressed here).
 
 render_idle's layout (header, bots list, candle chart) is comfortable at
-the 800x480 default but genuinely tight at 480x320 - the size commonly
-quoted for the actual MHS35 panel this ships with (see image/README.md
-"LCD display setup") - once 3 bots are active, since fixed pixel offsets
-don't adapt to available height. Verified by headless render during
-development (SDL_VIDEODRIVER=dummy + pygame.image.save), same technique
-that caught the original timezone/banner-overlap bugs. Not solved with a
-responsive layout in this pass - flagged in image/README.md "What remains"
-pending the real panel's confirmed resolution, rather than guessed at now.
+the 800x480 default but genuinely tight at the real panel's confirmed
+480x320 (via /sys/class/graphics/fb0/virtual_size on real Pi 5 hardware)
+once 3 bots are active, since fixed pixel offsets don't adapt to available
+height. Verified by headless render during development (SDL_VIDEODRIVER=dummy
++ pygame.image.save), same technique that caught the original
+timezone/banner-overlap bugs. Not solved with a responsive layout in this
+pass - still flagged in image/README.md "What remains".
 """
 
 from __future__ import annotations
 
+import os
 from datetime import datetime, timezone
 
 import pygame
 
 from display.bot_view import BotView
 from display.candles import Candle
+from display.framebuffer import FramebufferWriter
 from display.last_trade import LastTradeInfo
 from display.snapshot import DisplaySnapshot, as_utc
 from display.stock_view import StockView
@@ -56,16 +68,25 @@ _BANNER_TEXT = {
 
 
 class PygameRenderer:
-    def __init__(self, size: tuple[int, int] = DEFAULT_SIZE) -> None:
-        self._size = size
+    def __init__(self, size: tuple[int, int] | None = None) -> None:
+        self._configured_size = size
+        self._size = size or DEFAULT_SIZE
         self._screen: pygame.Surface | None = None
         self._font_large: pygame.font.Font | None = None
         self._font_medium: pygame.font.Font | None = None
         self._font_small: pygame.font.Font | None = None
+        self._fb: FramebufferWriter | None = None
 
     def init(self) -> None:
         pygame.init()
         pygame.mouse.set_visible(False)
+
+        fb_device = os.environ.get("MONSTRAPRO_FB_DEVICE")
+        if fb_device:
+            self._fb = FramebufferWriter(fb_device)
+            self._size = self._configured_size or self._fb.detect_size()
+            self._fb.open(*self._size)
+
         self._screen = pygame.display.set_mode(self._size)
         pygame.display.set_caption("Monstra.Pro Box")
         self._font_large = pygame.font.SysFont("arial", 40, bold=True)
@@ -79,7 +100,14 @@ class PygameRenderer:
         return True
 
     def shutdown(self) -> None:
+        if self._fb is not None:
+            self._fb.close()
         pygame.quit()
+
+    def _present(self) -> None:
+        pygame.display.flip()
+        if self._fb is not None:
+            self._fb.write(self._require_screen())
 
     # -- screens --------------------------------------------------------
 
@@ -107,7 +135,7 @@ class PygameRenderer:
         self._draw_candles(screen, y, snapshot.candles, label="Performance")
         self._draw_local_access_footer(screen, local_pin)
         self._draw_banner(screen, banner)
-        pygame.display.flip()
+        self._present()
 
     def render_idle_bot(self, view: BotView, banner: str | None, *, local_pin: str | None = None) -> None:
         """idle_rotation.IdlePhase.BOT - one active bot at a time, rotating
@@ -133,7 +161,7 @@ class PygameRenderer:
         self._draw_candles(screen, y, view.candles, label="Value (approx.)")
         self._draw_local_access_footer(screen, local_pin)
         self._draw_banner(screen, banner)
-        pygame.display.flip()
+        self._present()
 
     def render_idle_stock(self, view: StockView, banner: str | None, *, local_pin: str | None = None) -> None:
         """idle_rotation.IdlePhase.STOCK - one top-mover symbol at a time,
@@ -158,7 +186,7 @@ class PygameRenderer:
         self._draw_candles(screen, y, view.candles, label="Price")
         self._draw_local_access_footer(screen, local_pin)
         self._draw_banner(screen, banner)
-        pygame.display.flip()
+        self._present()
 
     def render_wifi_setup(self, ap_ssid: str | None, setup_url: str | None, banner: str | None) -> None:
         screen = self._require_screen()
@@ -179,7 +207,7 @@ class PygameRenderer:
         screen.blit(url, url.get_rect(center=(width // 2, height // 2 + 65)))
 
         self._draw_banner(screen, banner)
-        pygame.display.flip()
+        self._present()
 
     def render_awaiting_activation(self, device_serial: str | None, banner: str | None) -> None:
         screen = self._require_screen()
@@ -197,7 +225,7 @@ class PygameRenderer:
         screen.blit(code, code.get_rect(center=(width // 2, height // 2 + 50)))
 
         self._draw_banner(screen, banner)
-        pygame.display.flip()
+        self._present()
 
     def render_trade_wake(self, snapshot: DisplaySnapshot, banner: str | None) -> None:
         screen = self._require_screen()
@@ -222,7 +250,7 @@ class PygameRenderer:
             y += 24
 
         self._draw_banner(screen, banner)
-        pygame.display.flip()
+        self._present()
 
     # -- shared pieces ----------------------------------------------------
 

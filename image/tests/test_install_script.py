@@ -72,6 +72,41 @@ def test_install_script_installs_the_service_package_itself_not_just_its_deps(sc
     assert "pip install --quiet -e ." in text
 
 
+def test_install_script_adds_monstrapro_user_to_video_group(scripts_dir):
+    """Regression guard for a real bug found on physical Pi 5 hardware:
+    /dev/fb0 is root:video mode 660 - without `video` group membership,
+    display.framebuffer.FramebufferWriter can never open it, even though the
+    service itself starts and runs without crashing. Must be applied
+    unconditionally (not only inside the `! id monstrapro` first-creation
+    branch), so a re-install on an already-provisioned device also picks it
+    up - useradd's --groups only takes effect at first creation."""
+    text = _text(scripts_dir, "install.sh")
+    assert "--groups netdev,video" in text
+    assert "usermod -aG video monstrapro" in text
+
+
+def test_install_script_creates_the_runtime_env_file(scripts_dir):
+    """Regression guard for a real bug found on physical Pi 5 hardware: every
+    monstrapro-*.service loads /etc/monstrapro/env (EnvironmentFile=-...), but
+    nothing ever created that file, so SDL_VIDEODRIVER was never set at all.
+    kmsdrm (the original plan) can't work on this panel anyway (no /dev/dri) -
+    see services/display/src/display/framebuffer.py."""
+    text = _text(scripts_dir, "install.sh")
+    assert "/etc/monstrapro/env" in text
+    assert "SDL_VIDEODRIVER=dummy" in text
+    assert "MONSTRAPRO_FB_DEVICE=/dev/fb0" in text
+
+
+def test_install_script_masks_getty_on_the_lcd_console(scripts_dir):
+    """Regression guard for a real bug found on physical Pi 5 hardware: with
+    nothing ever taking the framebuffer away from it, getty@tty1's own
+    login-shell console was what was actually visible on the LCD, not the
+    display app - `systemctl mask` (not just `disable`) since tty1's getty is
+    otherwise started unconditionally regardless of enablement."""
+    text = _text(scripts_dir, "install.sh")
+    assert "systemctl mask getty@tty1.service" in text
+
+
 def test_install_script_has_no_obviously_destructive_wildcard_removal(scripts_dir):
     text = _text(scripts_dir, "install.sh")
     assert "rm -rf /" not in text

@@ -56,8 +56,16 @@ echo "Installing Monstra.Pro Box (version=$VERSION, dry_run=$DRY_RUN)"
 if ! id monstrapro >/dev/null 2>&1; then
     run groupadd --system monstrapro
     run useradd --system --gid monstrapro --home-dir /var/lib/monstrapro \
-        --shell /usr/sbin/nologin --groups netdev monstrapro
+        --shell /usr/sbin/nologin --groups netdev,video monstrapro
 fi
+# Re-applied unconditionally (not just inside the ! id check above) so a
+# re-install on an already-provisioned device also gets this - useradd's
+# --groups only takes effect at first creation. `video` group membership is
+# required for display.framebuffer.FramebufferWriter to open /dev/fb0
+# (root:video, mode 660) - caught live on real Pi 5 hardware: the display
+# service could start and run without crashing while never actually being
+# able to open the framebuffer device at all.
+run usermod -aG video monstrapro
 
 # --- directory layout --------------------------------------------------------
 run mkdir -p /opt/monstrapro/releases /var/lib/monstrapro /etc/monstrapro
@@ -123,6 +131,37 @@ run cp -n "$REPO_ROOT/image/config/monstrapro.toml" /etc/monstrapro/config.toml
 run mkdir -p /etc/NetworkManager/dnsmasq-shared.d
 run cp "$REPO_ROOT/image/config/dnsmasq-setup-domain.conf" \
     /etc/NetworkManager/dnsmasq-shared.d/monstra-setup.conf
+
+# --- runtime env (SDL video driver + framebuffer target) ---------------------
+# Every monstrapro-*.service loads this via EnvironmentFile=-/etc/monstrapro/env.
+# This is what was missing on real Pi 5 hardware bring-up: the file never got
+# created at all, so no service ever saw an SDL_VIDEODRIVER override - and this
+# panel (goodtft/MHS35) has no /dev/dri, so SDL_VIDEODRIVER=kmsdrm (the
+# original plan, previously set by the now-deleted deploy/systemd) could never
+# have worked here anyway. display instead renders off-screen and writes
+# straight into MONSTRAPRO_FB_DEVICE itself - see
+# services/display/src/display/framebuffer.py. `-n`-style guard (matching
+# config.toml above): never clobber a device-specific override on a re-install.
+if [ ! -f /etc/monstrapro/env ]; then
+    run bash -c "cat > /etc/monstrapro/env" <<'ENVEOF'
+SDL_VIDEODRIVER=dummy
+MONSTRAPRO_FB_DEVICE=/dev/fb0
+ENVEOF
+fi
+
+# --- stop the console fighting the LCD for the same framebuffer --------------
+# image/config/image.toml's intent: "Boots to a text console, no desktop
+# environment, no login prompt - display is the only thing on screen." On
+# real hardware getty@tty1 (with autologin) was left running and printing
+# straight to the same /dev/fb0 the LCD driver maps to - since nothing ever
+# took the framebuffer away from it (no KMS/DRM device for a display manager
+# or SDL to grab exclusively on this panel), that console/login shell is what
+# was actually visible on the LCD, indefinitely. `mask` (not just `disable`)
+# because tty1's getty is otherwise started unconditionally regardless of
+# enablement. SSH remains the only access path (Instructions.txt) - unrelated
+# to this.
+run systemctl mask getty@tty1.service
+run systemctl stop getty@tty1.service
 
 # --- systemd units -----------------------------------------------------------
 run cp "$REPO_ROOT"/image/systemd/monstrapro-*.service "$REPO_ROOT"/image/systemd/monstrapro-*.timer \

@@ -3,7 +3,9 @@
 Responsibilities (see ARCHITECTURE.md section 4.2):
 
   1. Init a native renderer (pygame_renderer.PygameRenderer, windowed on a
-     dev machine / KMSDRM on the real device via SDL_VIDEODRIVER).
+     dev machine / writing straight to /dev/fb0 on the real device - see
+     pygame_renderer.py's module docstring for why kmsdrm isn't viable
+     there).
   2. Poll device_core.events and drive state.StateMachine: idle /
      wifi_setup / awaiting_activation / trade_wake, plus a connection-status
      banner.
