@@ -1,6 +1,7 @@
 MONSTRA PRO BOX - WHERE WE LEFT OFF
 ====================================
-Paused: 2026-08-02, mid first real hardware bring-up session on a Pi 5.
+Paused: 2026-08-03 (evening, market closed), continuing a multi-day
+real-hardware bring-up session on a Pi 5 that started 2026-08-02.
 
 This is a session-status handoff, not a how-to guide - for setup steps see
 Instructions.txt. For the full technical picture see image/README.md and
@@ -15,7 +16,9 @@ DEVICE ACCESS
               known-good fallback)
   Repo on Pi: ~/MonstraPro (git remote: https://github.com/MPoncini96/MonstraPro, branch main)
   Repo here:  C:\dev\MonstraPro
-  Latest pushed commit as of pausing: 251bb10
+  Latest pushed commit as of pausing: 3f58478 (deployed to the Pi via
+  git pull + install.sh + restart monstrapro-worker.service - see
+  2026-08-03 section below for what's in it)
 
 
 CURRENT PHYSICAL STATE
@@ -317,12 +320,11 @@ FIXED SINCE PAUSING (2026-08-02, later same day, commit 8994bab, pushed)
        - Recheck cadence: every ACCOUNT_SNAPSHOT_INTERVAL_SECONDS (60s) -
          same tick as the account-equity snapshot poll, so a disconnect
          takes effect within about a minute.
-     NOT yet deployed/verified on the physical Pi - built and unit-tested
-     only as of this writing (42 trading_worker tests + 103 device_core
-     tests passing). Needs: git pull on the Pi, restart
-     monstrapro-worker.service, then actually disconnect from the website
-     and confirm the device's LCD flips back to the pairing screen within
-     ~60s without a manual restart.
+     DEPLOYED 2026-08-03 (commit dfe2824) - built, unit-tested, and pushed
+     to the Pi (git pull + install.sh + restart monstrapro-worker.service).
+     NOT yet manually exercised end-to-end (haven't actually clicked
+     Disconnect on the website and watched the LCD flip back within ~60s) -
+     next time it's convenient to disconnect/re-pair, confirm that.
 
   4. NEW FEATURE: "Run algorithms now" button on /devices, next to each
      active device's card - lets the owner trigger an immediate trading
@@ -349,12 +351,11 @@ FIXED SINCE PAUSING (2026-08-02, later same day, commit 8994bab, pushed)
          but the market is closed by the time the device polls, discards
          (acks without running) rather than leaving it pending until the
          market reopens.
-     NOT yet deployed/verified live - the Prisma migration alone blocks it
-     end-to-end (the runRequestedAt column doesn't exist in the live DB
-     yet). Needs: migration deploy, then git pull + restart
-     monstrapro-worker.service on the Pi, then click the button during
-     market hours and confirm a trade_executed event / order shows up
-     without waiting for the normal cycle.
+     DEPLOYED AND VERIFIED LIVE 2026-08-03: migration deployed, Pi updated,
+     clicked "Run algorithms now" for real during market hours - it worked
+     (see the 2026-08-03 (continued) section below for what that test
+     actually surfaced: two much bigger pre-existing gaps it accidentally
+     uncovered, both now also fixed).
 
   ANSWERED, NOT BUILT: owner asked how much work physical buttons/a menu on
   the device itself would be. Answer given in-conversation (not written
@@ -363,6 +364,92 @@ FIXED SINCE PAUSING (2026-08-02, later same day, commit 8994bab, pushed)
   working touch or wired physical buttons at all?). Not scoped in as a
   quick add; revisit with the owner once that hardware question is
   answered.
+
+
+2026-08-03 (continued, later same day) - THE BIG ONE #5: clicking "Run
+algorithms now" for the first time surfaced that bot selections had NEVER
+actually reached this device, and that fixing it immediately caused a
+second, real bug (4 of 5 bots erroring on a shared position). Both now
+fixed, deployed, and pushed (MonstraPro commits dfe2824, d939d17, 3f58478;
+NextJS_Monsta commits 8f83853, 5212868):
+
+  1. ROOT CAUSE FOUND: 5 bots were selected on monstra.pro's bot-picker for
+     this device, but trading_worker's local strategy_config table was
+     completely empty - confirmed by querying the device's own sqlite DB
+     directly over SSH. Nothing had EVER synced a website bot selection
+     into any device, on any schedule, ever - services/updater/main.py has
+     always used NullManifestClient (an honest "nothing to fetch"
+     placeholder, per its own docstring) instead of a real HTTP client, so
+     the one existing sync mechanism never actually ran. This predates this
+     session entirely; it's not something introduced by the run-now work,
+     it's the reason the run-now request had nothing to run.
+     Fixed with a NEW, separate mechanism (not the old updater/manifest
+     path - see loop.py's own docstring for why trading_worker owns this
+     directly): trading_worker/bot_selection_sync.py polls
+     GET /api/devices/strategy-config every trading-loop tick and
+     creates/updates/deactivates local strategy_config rows to mirror the
+     website's current selection (never touches a source="local" row).
+     Also added strategy_config.bot_type (device_core migration 0007) so
+     the device can tell a bot's engine (force/aptet/draco) apart from its
+     per-instance slug (e.g. "vectura_draco") - loop.py's runner lookup
+     needs the former, monstra.pro only ever gave the device the latter
+     before this.
+     VERIFIED LIVE: all 5 bots showed up in the device's local DB with the
+     right bot_type immediately after redeploying.
+
+  2. SECOND BUG, found by the FIRST FIX actually working: with all 5 bots
+     now really running for the first time, 4 of them hit hard "insufficient
+     qty available" 403 errors from Alpaca in the same cycle - all 5 bots
+     were independently computing trades against the FULL shared account
+     (each assuming it alone owned 100% of equity and every position), so
+     when more than one decided to sell the same held symbol (ERX), only
+     the first submission succeeded. Confirmed via the device's local
+     `order` table: only one bot's sells (ERX, BKNG) actually went through;
+     no double-selling happened (Alpaca's own qty check is what stopped
+     it), but the errors were real and would recur every cycle.
+     Fixed (a real architecture change, planned via a written design doc
+     before implementing given it touches live trading logic - see
+     ARCHITECTURE.md section 10, updated to reflect this is no longer
+     deferred):
+       - device_core: strategy_config.equity_weight (migration 0008) - a
+         positive float, null/omitted treated as 1.0 (equal share).
+       - NextJS_Monsta: DeviceBotSelection.equityWeight (new migration),
+         PUT /api/devices/[deviceId]/bot-selection accepts an optional
+         equityWeights map, GET returns it, DeviceBotPicker.tsx shows a
+         per-selected-bot weight input with a live "≈ X% of account"
+         preview. Relative weight, not a percentage-sums-to-100 design
+         deliberately - existing bots need zero reconfiguration to keep
+         working (they all default to equal share).
+       - trading_worker/loop.py rewritten: each bot's signal computation no
+         longer submits its own orders. run_cycle fetches the account/
+         positions ONCE (not once per bot - itself part of the old race),
+         scales every active bot's own (locked-symbol-excluded) target
+         weights by its equity-weight share into dollar terms, SUMS them
+         per symbol across every bot, and runs the combined total through
+         the existing compute_order_plan() exactly once. A bot that HOLDs
+         (or errors) this cycle still contributes its last known
+         allocation (core.allocations.latest), re-excluded against
+         whatever's locked THIS cycle, so a transient failure or a locked-
+         after-the-fact symbol never forces an unwanted sale. Netted orders
+         are recorded under a synthetic bot_slug "_portfolio" - a
+         deliberate, flagged trade-off: per-bot order/trade history is lost
+         for any trade that got netted with another bot's, though each
+         bot's own signals/state/target-weight history are untouched.
+     DEPLOYED to the Pi (git pull + install.sh + restart
+     monstrapro-worker.service). NOT yet verified live - the market closed
+     before this could be tested; see "HOW TO RESUME" below, this is
+     tomorrow's first step.
+
+  KNOWN GAPS FLAGGED BUT NOT BUILT (deliberately, discuss before building):
+    - True per-bot order attribution once trades are netted (a virtual
+      per-bot sub-account ledger, so a combined order could be split back
+      into per-bot trade history) - see ARCHITECTURE.md section 10.
+    - services/updater's NullManifestClient / manifest.strategyUpdates path
+      is STILL a placeholder - bot_selection_sync.py (above) is a separate,
+      new mechanism that does NOT go through updater or the manifest
+      endpoint at all. Building a real HTTPManifestClient remains open, but
+      nothing depends on it now that strategy-config sync exists directly
+      in trading_worker.
 
 
 NOT YET WORKING / NOT YET TESTED
@@ -387,11 +474,20 @@ NOT YET WORKING / NOT YET TESTED
 
 HOW TO RESUME
 ----------------
-1. Power the Pi back on, wait ~1-2 min for it to boot.
+0. FIRST THING, once the market opens: verify the cross-bot netting fix for
+   real (the actual reason we paused here) - watch
+   `sudo journalctl -u monstrapro-worker.service -f` (or the device's local
+   `order`/`strategy_config` tables, same sqlite one-liners used this
+   session) through at least one full trading cycle and confirm (a) no more
+   "insufficient qty" 403s, (b) at most one order per symbol per cycle even
+   with all 5 bots active, (c) orders show up under bot_slug="_portfolio"
+   in the local `order` table. The Pi already has this deployed
+   (commit 3f58478) - no redeploy needed, just watch it run.
+1. Power the Pi back on, wait ~1-2 min for it to boot (if it was shut down).
 2. ssh mponcini@10.0.0.193
-3. cd ~/MonstraPro && git pull   (pick up anything pushed since 96d7f6d)
-4. Look at the LCD - the app should be showing now (fixed this session, see
-   above). Double-check rotation still looks right while you're there.
+3. cd ~/MonstraPro && git pull   (pick up anything pushed since 3f58478)
+4. Look at the LCD - the app should be showing now (fixed earlier this
+   session). Double-check rotation still looks right while you're there.
 5. Pairing + Alpaca connection are both DONE - device shows activated,
    /devices on monstra.pro shows this device with Alpaca connected
    (live mode), and trading_worker's market data provider is confirmed
