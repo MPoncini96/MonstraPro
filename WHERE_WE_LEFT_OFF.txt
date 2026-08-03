@@ -1,0 +1,405 @@
+MONSTRA PRO BOX - WHERE WE LEFT OFF
+====================================
+Paused: 2026-08-02, mid first real hardware bring-up session on a Pi 5.
+
+This is a session-status handoff, not a how-to guide - for setup steps see
+Instructions.txt. For the full technical picture see image/README.md and
+ARCHITECTURE.md.
+
+
+DEVICE ACCESS
+-------------
+  SSH:        ssh mponcini@10.0.0.193
+              (monstrapro.local *may* also work - it was unreliable via
+              mDNS from Windows earlier in this session; the IP is the
+              known-good fallback)
+  Repo on Pi: ~/MonstraPro (git remote: https://github.com/MPoncini96/MonstraPro, branch main)
+  Repo here:  C:\dev\MonstraPro
+  Latest pushed commit as of pausing: 251bb10
+
+
+CURRENT PHYSICAL STATE
+-----------------------
+  - Pi is shut down (sudo shutdown -h now was run to pause the session).
+  - 3.5in LCD is connected; HDMI is not.
+  - Rotation is set to 180 and the owner confirmed "rotation is better"
+    after the last reboot - NOT explicitly re-confirmed as fully correct
+    (vs. just improved) with the app actually rendering on screen. Worth
+    a fresh look on resume before assuming this is fully settled.
+  - Pi already has a saved home Wi-Fi connection (from initial setup), so
+    device_agent's onboarding flow (temporary AP, setup.monstra page) has
+    NOT been exercised for real yet on this device.
+
+
+WHAT'S CONFIRMED WORKING ON REAL HARDWARE
+------------------------------------------
+  - Raspberry Pi OS Lite (64-bit) installs and boots fine on a Pi 5.
+  - image/scripts/install.sh runs successfully end-to-end (after the fixes
+    below).
+  - The LCD driver (goodtft/LCD-show / MHS35-show) DOES work on Pi 5 -
+    this was flagged as an unverified risk before real testing; it's
+    confirmed fine now.
+  - monstrapro-display.service: active/running, no crash. (ALSA warnings
+    appear in its logs - pygame trying to init an audio mixer with no
+    sound device configured. Harmless/cosmetic, not blocking anything.
+    Worth a cleanup pass later to suppress pygame's audio init entirely
+    since display never needs sound.)
+  - monstrapro-worker.service: active/running, no crash.
+  - monstrapro-agent.service: exits cleanly with status=0/SUCCESS - this
+    is CORRECT behavior (it detected an existing saved Wi-Fi connection
+    and exited without needing to onboard), not a bug.
+  - The concern about SDL_VIDEODRIVER=kmsdrm needing a DRM device that
+    this panel doesn't have (only /dev/fb0, no /dev/dri/) turned out NOT
+    to be an actual blocker - display.service runs fine. Whatever SDL
+    auto-selected worked. Don't spend time chasing this further unless a
+    real symptom shows up.
+
+
+BUGS FOUND AND FIXED THIS SESSION (all pushed to origin/main)
+-----------------------------------------------------------------
+Every one of these was caught ONLY by running on real hardware - none
+were visible from static review or the Windows dev machine. In order:
+
+  1. image/scripts/*.sh were committed without the executable bit
+     (created on Windows, which has no exec-bit concept). Fixed:
+     git update-index --chmod=+x. Commit e1251b5.
+
+  2. install.sh ran each service's `pip install -r requirements.txt` from
+     the wrong working directory, so the `-e ../../packages/...` editable
+     lines inside those files couldn't resolve. Fixed by cd-ing into each
+     service directory first. Commit 983b486.
+
+  3. THE BIG ONE: image/systemd/*.service units used
+     `Requisite=monstrapro-firstboot.service`. firstboot.service only
+     does real work once (ConditionPathExists guard), so on every boot
+     after the first, systemd *skips* it rather than marking it active -
+     and Requisite= requires the target to be genuinely active. Every
+     dependent service (display, worker, agent, portfolio-web, lcd-setup)
+     silently refused to start on any boot past the first. Fixed by
+     dropping Requisite=, keeping the existing After= (ordering only).
+     Commit 568cc9c. Regression test added.
+
+  4. install.sh never ran `pip install -e .` for a service's OWN package
+     (only its dependencies via requirements.txt) - every service hit
+     ModuleNotFoundError: No module named 'X' the first time it actually
+     tried to start (only visible after bug #3 was fixed). Commit
+     5d994c5. Regression test added.
+
+  5. lcd-setup.sh's rotation idempotency used one marker file PER
+     rotation value (.lcd-rotation-180, .lcd-rotation-0, ...), which
+     never got cleaned up - switching 180 -> 0 -> back to 180 silently
+     no-op'd on the second 180 because that stale marker was still there
+     from the very first install. Replaced with a single
+     .lcd-rotation-current file compared against the requested value.
+     Commit 251bb10. Regression test added.
+
+
+FIXED SINCE PAUSING (2026-08-02, later same day, commit 8994bab, pushed)
+-----------------------------------------------------------------------
+  THE BIG ONE #2: the LCD was stuck showing getty@tty1's own console/login
+  shell forever, never the app - despite monstrapro-display.service showing
+  active/running with zero crashes the whole time. Confirmed live on real
+  hardware, root cause was three compounding bugs:
+    1. /etc/monstrapro/env was never created by install.sh at all (nothing
+       ever wrote it), so no service ever saw an SDL_VIDEODRIVER override.
+    2. Even if it had: this panel (goodtft/MHS35) has no /dev/dri, so
+       SDL_VIDEODRIVER=kmsdrm - the original plan, previously set by the
+       now-deleted deploy/systemd - can never work here. Tried every real
+       SDL driver by hand on the device: all report "not available" except
+       the invisible dummy/offscreen ones.
+    3. monstrapro wasn't in the `video` group, so it couldn't have opened
+       /dev/fb0 (root:video, mode 660) even if a driver had tried to.
+  Fix: display now renders off-screen (SDL_VIDEODRIVER=dummy) and writes
+  finished frames directly into /dev/fb0 via mmap
+  (services/display/src/display/framebuffer.py), auto-sized from the
+  framebuffer's own reported 480x320. install.sh now adds monstrapro to the
+  video group, creates /etc/monstrapro/env, and masks getty@tty1.service (so
+  the console stops fighting the LCD for the same screen). Verified live:
+  the app is now visibly rendering on the physical LCD. Rotation was NOT
+  re-checked in this pass now that real content is showing - worth a fresh
+  look on next resume.
+
+  THE BIG ONE #3 (commit 358803b, pushed): monstrapro-portfolio-web.service
+  was crash-looping (Address already in use, port 80) - 560+ restart
+  attempts deep by the time this was caught. Root cause: device_agent's
+  main() unconditionally bound port 80 for its onboarding setup page
+  *before* ever checking whether onboarding was even needed. Found a
+  device_agent process that had been alive 45+ minutes, stuck in AP mode
+  holding port 80, despite the device having working Wi-Fi the entire
+  time - probably wedged from a connectivity race on some earlier
+  boot/restart. Fixed: main() now checks has_usable_connection() first and
+  returns immediately without touching port 80 when already connected.
+  Restarted the stuck process to free the port. Verified live:
+  portfolio_web now serves its PIN-gated page at http://monstrapro.local
+  (curled it from the Windows dev machine, got the real login page back).
+  The PIN itself is on the LCD's footer.
+
+  THE BIG ONE #4 (commit ec85477, pushed): after the LCD fix above, the
+  owner noticed the LCD was showing the generic idle screen ("no trades
+  yet", "market closed", "never synced") instead of the activation/pairing
+  screen, despite the device never having been activated
+  (device.activated_at was null the whole time - confirmed by querying
+  /var/lib/monstrapro/monstrapro.db directly). Root cause:
+  trading_worker.main published `awaiting_activation` exactly ONCE, on
+  process entry. display's screen state is rebuilt purely by replaying
+  *unconsumed* device_event rows, and consumed_at is one global flag per
+  event (not per-consumer) - so once display consumed that single event
+  (hours earlier), it was gone forever for any future consumer, including
+  a freshly-restarted display process. Restarting monstrapro-display.service
+  multiple times tonight (to test the LCD/framebuffer fix) is exactly what
+  silently dropped the activation screen back to generic idle - trading_worker
+  itself never restarted, so it never got a chance to re-publish.
+  Fixed: trading_worker now republishes awaiting_activation on every
+  60-second poll instead of once (_wait_for_activation in
+  services/trading_worker/src/trading_worker/main.py). Verified live:
+  restarted monstrapro-worker.service, the LCD switched to the
+  activation/pairing-code screen within seconds.
+
+  NOTE for future sessions: this same one-shot-event-vs-restarted-consumer
+  trap could still bite other single-publish events (e.g. wifi_onboarding_started
+  if wifi_setup ever needs to survive a display restart mid-onboarding) -
+  worth keeping in mind, not fixed everywhere preemptively since only
+  awaiting_activation was actually observed to break.
+
+  DEVICE ACTIVATION / PAIRING - BUILT AND VERIFIED END-TO-END THIS SESSION
+  (commits 7fcbdd2, fa8be67, 62cde7b, e56a8f7, pushed). Turns out
+  monstra.pro's device API (register/pair/status) was already fully built
+  and live (NextJS_Monsta's src/app/api/devices/{register,pair,status} +
+  src/app/dashboard/devices/pair) - the device side just never called it.
+  Built the missing link:
+    - device_core migration 0006: device.pairing_code (plaintext, shown on
+      LCD), device.pairing_code_expires_at, device.device_token_encrypted
+      (Vault-encrypted, this device's bearer credential).
+    - trading_worker.activation.HTTPActivationClient: registers with
+      monstra.pro (or re-registers if the pairing code expired unused),
+      polls /api/devices/status with the bearer token, persists activation
+      locally once confirmed. Wired into main.py for real hardware
+      (LocalActivationClient stays for offline/simulated dev - same
+      Linux-real/non-Linux-simulated split as device_agent).
+    - display now shows the real pairing code (not the raw serial) as the
+      big text on the AWAITING_ACTIVATION screen, serial as a small
+      reference line underneath.
+    - Found and fixed live: monstra_pro_api_url defaulted to the naked
+      "https://monstra.pro", which 308-redirects to www.monstra.pro -
+      `requests` strips the Authorization header on that cross-host
+      redirect, so every authenticated call silently became anonymous
+      (401). Fixed the default (and the live device's /etc/monstrapro/config.toml,
+      which had the old value baked in from an earlier install.sh run -
+      config.toml is --no-clobber by design, so re-running install.sh
+      does NOT pick up this fix on an already-provisioned device; it was
+      patched by hand on this Pi).
+  Verified live end-to-end: registration succeeded, poll against the real
+  API succeeded with no error, and the LCD now shows a real pairing code
+  (confirmed one: F7Q3FX67, though it's single-use/15-min-TTL so a fresh
+  one may already have replaced it by the time you read this - that's
+  expected, working behavior, not a bug).
+
+  PAIRING + ALPACA CONNECTION - FULLY COMPLETED AND VERIFIED END-TO-END
+  (2026-08-03, same session, NextJS_Monsta commits e7e9d8b/628c89c,
+  MonstraPro commit 96d7f6d, all pushed). Picking up where the section
+  above left off:
+
+  1. monstra.pro was going to share monstra.bot's Clerk application, but
+     Clerk's production keys are locked to a single authorized domain -
+     signing in on monstra.pro failed outright ("Production Keys are only
+     allowed for domain monstra.bot"). Fixed by creating a genuinely
+     separate Clerk application for monstra.pro instead of paying for
+     Clerk's satellite-domain feature - monstra.pro and monstra.bot users
+     are now completely separate identities, never shared, matching what
+     the owner explicitly wanted. Needed a `clerk.monstra.pro` CNAME
+     (-> frontend-api.clerk.services, same target monstra.bot already
+     uses) added at whatever registrar manages monstra.pro's DNS, and Clerk
+     needed time afterward to provision a TLS cert for that hostname - the
+     ERR_SSL_VERSION_OR_CIPHER_MISMATCH in between was that provisioning
+     lag, not a misconfiguration.
+
+  2. monstra.pro was serving monstra.bot's ENTIRE site (monstra.pro/vectors
+     worked, etc.) - not what the owner wanted for this domain. Fixed:
+     src/lib/server/monstraProRoutes.ts now allowlists only the Pro Box
+     landing page, /devices(.*), and sign-in/up; anything else 307s to the
+     equivalent monstra.bot URL. Enforced in src/proxy.ts.
+
+  3. First real sign-in on monstra.pro bounced straight to monstra.bot
+     instead of the pairing flow - Clerk's hardcoded post sign-in/up
+     redirects (/home, /create-username) aren't in that allowlist, and the
+     redirect logic didn't check auth state before bouncing. Fixed: signed
+     in + blocked path now lands on /devices instead of monstra.bot.
+
+  4. Signing in and reaching /dashboard/devices then hit an INFINITE
+     REDIRECT LOOP ("glitchy" loading screen that never resolved) -
+     src/app/dashboard/layout.tsx requires a row in the shared `users`
+     table (monstra.bot's full account model: XP, level, Stripe Connect,
+     ...), which a separate-Clerk-app monstra.pro user will never have by
+     design. Fixed by moving the device pages to their own /devices route
+     (plain git rename) with a new, minimal DevicesLayout that only
+     requires a signed-in Clerk session - nothing about "complete app
+     user".
+
+  5. A real pairing was completed for real, confirmed both in the Clerk
+     dashboard and in this device's own local DB.
+
+  6. Discovered mid-session, not before: nothing anywhere (website or
+     device) actually transmitted Alpaca credentials to the device -
+     device_core.CredentialRepository.save() was only ever called from
+     tests in either repo, despite Objectives.txt describing this as core
+     to the original plan. Built the missing link:
+       - NextJS_Monsta: new /devices/alpaca page (account-level, not
+         per-device) + POST /api/devices/alpaca (owner's browser, reuses
+         the main site's own validateAlpacaCredentials/replaceAlpacaConnection
+         but deliberately skips ensureAppUser() - same "no shared users
+         row" reasoning as #4) + GET /api/devices/alpaca-credentials (the
+         one device endpoint that returns raw credentials, bearer-token
+         authenticated like /api/devices/status).
+       - MonstraPro: trading_worker.alpaca_sync.sync_alpaca_credentials_if_missing,
+         wired into _build_alpaca_client - fetches from monstra.pro only
+         when no local credentials exist yet, then relies on the local
+         Vault from then on.
+     Verified live end-to-end: connected a real live-mode Alpaca account
+     from the website, confirmed the row landed in this device's own
+     encrypted local vault (mode=live, connected_at matching), and
+     confirmed trading_worker's market data provider switched from its
+     yfinance fallback to real Alpaca data with zero errors.
+
+  KNOWN GAPS FLAGGED BUT NOT BUILT (deliberately, discuss before building):
+    - Reconnecting/rotating the Alpaca connection from monstra.pro after
+      the device's first sync is not picked up automatically - the device
+      only ever checks once local credentials are missing, by design (see
+      alpaca_sync.py's docstring). Fine for now; would need real thought
+      (how does the device know to re-check?) before building further.
+    - No formal legal/risk disclosure flow for connecting LIVE mode on
+      monstra.pro (there's just a plain confirmation checkbox on the
+      connect form) - monstra.bot's own /brokerage flow has a real
+      disclosure-acceptance system tied to `user_legal_acceptance`,
+      deliberately not reused here since it's tied to monstra.bot's
+      account model.
+
+
+  DISCONNECT + ONE-DEVICE-PER-ACCOUNT + PERIODIC RE-ACTIVATION CHECK +
+  "RUN NOW" BUTTON (2026-08-03, same session, later - NextJS_Monsta and
+  MonstraPro commits not yet made as of writing this; changes are staged
+  locally in both repos, not yet committed/pushed):
+
+  1. Added an Alpaca "Disconnect" button per-mode on /devices/alpaca
+     (AlpacaConnectClient.tsx) - POSTs to the pre-existing-but-until-now-
+     unused-by-any-UI /api/devices/alpaca/disconnect route.
+
+  2. Noticed a user could pair more than one device to the same account -
+     since AlpacaConnection is account-level (not per-device), two paired
+     devices would both trade against the same buying power at once.
+     Fixed: POST /api/devices/pair now 409s with code "device_limit_reached"
+     if the account already has an activated device; the /devices "Pair a
+     device" button becomes "Disconnect Device" (DisconnectDeviceButton.tsx)
+     whenever one is already active, calling the also-new
+     POST /api/devices/[deviceId]/disconnect (revokes the device's bearer
+     token, clears userId/activatedAt so it's free to be re-paired).
+
+  3. FLAGGED THEN CLOSED THIS SESSION: disconnecting a device on the website
+     didn't proactively tell the physical device - trading_worker's old
+     HTTPActivationClient.check_status() short-circuited to "still
+     activated" forever once locally activated, with zero further network
+     calls. A disconnected Pi would keep trading on cached local state until
+     manually restarted. Fixed:
+       - device_core.DeviceRepository.deactivate() (new) - clears
+         activated_at/owner_ref/device_token_encrypted/pairing_code, mirror
+         image of activate().
+       - trading_worker.activation.HTTPActivationClient now re-verifies with
+         /api/devices/status on EVERY check_status() call, even once locally
+         activated (_recheck_activated) - a 401 (revoked token) or an
+         explicit {"activated": false} body deactivates locally; any other
+         failure (timeout, DNS, 5xx) is treated as a transient blip and
+         leaves the device activated, so a Wi-Fi hiccup can't itself kick a
+         paired device offline.
+       - trading_worker.main.py refactored: the old single `while True`
+         trading loop is now _run_trading_loop(), which returns as soon as
+         that recheck reports deactivated; main()'s outer loop then calls
+         _wait_for_activation() again - no service restart needed to
+         re-pair after a website-side disconnect.
+       - Recheck cadence: every ACCOUNT_SNAPSHOT_INTERVAL_SECONDS (60s) -
+         same tick as the account-equity snapshot poll, so a disconnect
+         takes effect within about a minute.
+     NOT yet deployed/verified on the physical Pi - built and unit-tested
+     only as of this writing (42 trading_worker tests + 103 device_core
+     tests passing). Needs: git pull on the Pi, restart
+     monstrapro-worker.service, then actually disconnect from the website
+     and confirm the device's LCD flips back to the pairing screen within
+     ~60s without a manual restart.
+
+  4. NEW FEATURE: "Run algorithms now" button on /devices, next to each
+     active device's card - lets the owner trigger an immediate trading
+     cycle outside the normal 5-minute schedule. Market-hours gated on BOTH
+     sides (button disabled client-side when the market's closed, and the
+     server independently re-checks Alpaca's /v2/clock before honoring the
+     request):
+       - Prisma: Device.runRequestedAt (migration
+         20260803090000_device_run_now_request - schema validated/generated
+         locally; NOT yet deployed to the live DB, needs the user's own
+         `prisma migrate deploy` per DATABASE_RUNBOOK.md).
+       - NextJS_Monsta: POST /api/devices/[deviceId]/run-now (owner's
+         browser, Clerk-auth, checks device ownership + live market clock,
+         sets runRequestedAt), GET /api/devices/run-request +
+         POST /api/devices/run-request/ack (device bearer-auth poll/ack,
+         same pattern as /api/devices/status), RunNowButton.tsx client
+         component wired into /devices/page.tsx.
+       - MonstraPro: new trading_worker.run_request module
+         (check_run_requested/ack_run_request, same resilience philosophy as
+         alpaca_sync.py - network failures never raise). main.py's
+         _run_trading_loop polls it every tick; if requested and the market
+         is open, runs reconcile_manual_holdings + run_cycle immediately
+         (bypassing TRADING_CYCLE_INTERVAL_SECONDS) and acks; if requested
+         but the market is closed by the time the device polls, discards
+         (acks without running) rather than leaving it pending until the
+         market reopens.
+     NOT yet deployed/verified live - the Prisma migration alone blocks it
+     end-to-end (the runRequestedAt column doesn't exist in the live DB
+     yet). Needs: migration deploy, then git pull + restart
+     monstrapro-worker.service on the Pi, then click the button during
+     market hours and confirm a trade_executed event / order shows up
+     without waiting for the normal cycle.
+
+  ANSWERED, NOT BUILT: owner asked how much work physical buttons/a menu on
+  the device itself would be. Answer given in-conversation (not written
+  here in full) - short version: real, multi-day feature, blocked on one
+  unverified hardware fact (does this specific 3.5in panel/enclosure have
+  working touch or wired physical buttons at all?). Not scoped in as a
+  quick add; revisit with the owner once that hardware question is
+  answered.
+
+
+NOT YET WORKING / NOT YET TESTED
+-----------------------------------
+  - Step 7 (Instructions.txt) - the real Wi-Fi onboarding flow (temporary
+    AP + setup.monstra page) - still not exercised for real, since this
+    device already has saved Wi-Fi and device_agent correctly skips
+    onboarding when that's true. To test it: remove the saved nmcli
+    connection and reboot (see Instructions.txt Step 7) - NOTE this will
+    drop the Pi off the network until it's onboarded again, so needs
+    physical/console access to recover, not just SSH.
+  - Step 8 (Instructions.txt) - the portfolio_web PIN-gated local page -
+    UNBLOCKED now (see above). Read the PIN off the LCD and try logging in
+    for real from a phone/laptop on the same home network.
+  - image/README.md's "What remains" items are all still open: the
+    NetworkManager polkit rule for device_agent, and the systemctl
+    restart polkit rule for updater. Neither has been hit yet in testing
+    (nothing has tried to use them for real) but both are still needed
+    before Wi-Fi onboarding and software updates will fully work
+    unattended.
+
+
+HOW TO RESUME
+----------------
+1. Power the Pi back on, wait ~1-2 min for it to boot.
+2. ssh mponcini@10.0.0.193
+3. cd ~/MonstraPro && git pull   (pick up anything pushed since 96d7f6d)
+4. Look at the LCD - the app should be showing now (fixed this session, see
+   above). Double-check rotation still looks right while you're there.
+5. Pairing + Alpaca connection are both DONE - device shows activated,
+   /devices on monstra.pro shows this device with Alpaca connected
+   (live mode), and trading_worker's market data provider is confirmed
+   using real Alpaca data (not the yfinance fallback). Nothing to redo here
+   unless something regresses.
+6. From a phone/laptop on the same home network, visit
+   http://monstrapro.local, read the PIN off the LCD's footer, and confirm
+   you can actually log in and edit bots/locked stocks for real - this was
+   only curl-verified to return the login page this session, not clicked
+   through end-to-end.
+7. From there, keep working down "NOT YET WORKING / NOT YET TESTED" above.

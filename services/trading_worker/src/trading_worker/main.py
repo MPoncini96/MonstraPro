@@ -12,13 +12,26 @@ Responsibilities (see ARCHITECTURE.md section 4.1):
                          docstring for why a one-shot publish is fragile to
                          a display restart), poll again after
                          ACTIVATION_POLL_INTERVAL_SECONDS.
-       activated     -> enter the trading loop.
+       activated     -> enter the trading loop (_run_trading_loop).
+     _run_trading_loop keeps re-verifying activation with monstra.pro on
+     every tick (ACCOUNT_SNAPSHOT_INTERVAL_SECONDS - see
+     activation.py's HTTPActivationClient._recheck_activated) rather than
+     trusting the local flag forever - this is what makes a website-side
+     disconnect (NextJS_Monsta's POST /api/devices/[deviceId]/disconnect)
+     actually stop an already-running device, instead of only taking
+     effect the next time this service restarts. If it detects
+     deactivation, _run_trading_loop returns and main()'s outer loop calls
+     _wait_for_activation again - no service restart needed to re-pair.
   3. Once activated, _build_alpaca_client syncs Alpaca credentials from
      monstra.pro on demand if none exist locally yet (alpaca_sync.py) -
      the device-side half of the connect flow in NextJS_Monsta's
      /devices/alpaca page. Only ever touches the network while local
      credentials are missing; once synced, relies on its own local Vault.
-  4. Trading loop, per scheduled cycle:
+  4. Trading loop, per scheduled cycle (TRADING_CYCLE_INTERVAL_SECONDS) or
+     immediately if the owner requested an out-of-schedule run from
+     monstra.pro (NextJS_Monsta's POST /api/devices/[deviceId]/run-now,
+     polled here via run_request.check_run_requested and market-hours
+     gated on both sides):
        reconcile_manual_holdings (manual_holdings.py) - buy up to each
          locked individual stock's target_qty, never sell
        -> run_cycle (loop.py) - fetch market data -> run the owner's
@@ -67,6 +80,7 @@ from trading_worker.alpaca_client import AlpacaClient
 from trading_worker.alpaca_sync import sync_alpaca_credentials_if_missing
 from trading_worker.loop import run_cycle
 from trading_worker.manual_holdings import reconcile_manual_holdings
+from trading_worker.run_request import ack_run_request, check_run_requested
 
 logger = logging.getLogger(__name__)
 
@@ -220,24 +234,30 @@ def _wait_for_activation(
     return status
 
 
-def main() -> None:
-    core = DeviceCore.load()
-    activation = _build_activation_client(core)
+def _run_trading_loop(core: DeviceCore, activation: ActivationClient) -> None:
+    """Runs snapshots + trading cycles until deactivated.
 
-    status = _wait_for_activation(core, activation)
-
-    core.events.publish(EventType.DEVICE_ACTIVATED, {"owner_ref": status.owner_ref})
-    _configure_market_data(core)
-
-    # Two independent cadences on one tick, rather than nested sleeps: the
-    # account-snapshot poll (fast, always-on) and the full trading cycle
-    # (slower, market-hours only) are gated by elapsed monotonic time, not
-    # by how the previous sleep happened to land - see this module's
-    # docstring for why snapshots aren't skipped while the market's closed.
+    Every tick also calls activation.check_status() - for HTTPActivationClient
+    this re-verifies with monstra.pro rather than trusting the local
+    activated flag forever (see activation.py's _recheck_activated), which is
+    what makes a website-side disconnect
+    (POST /api/devices/[deviceId]/disconnect) actually stop an
+    already-running device instead of only taking effect on its next
+    restart. That recheck therefore happens on the same
+    ACCOUNT_SNAPSHOT_INTERVAL_SECONDS (60s) cadence as everything else in
+    this loop. Returns (rather than exiting the process) once deactivated,
+    so main() can loop back into _wait_for_activation and pick up a fresh
+    pairing without a service restart.
+    """
     last_snapshot_at = 0.0
     last_cycle_at = 0.0
 
     while True:
+        status = activation.check_status()
+        if not status.activated:
+            logger.warning("device no longer activated; returning to awaiting-activation state")
+            return
+
         alpaca = _build_alpaca_client(core)
         if alpaca is None:
             logger.warning("device activated but no Alpaca credentials connected yet; waiting")
@@ -253,7 +273,22 @@ def main() -> None:
                 logger.exception("account snapshot poll failed")
             last_snapshot_at = now
 
-        if market_data_provider.is_market_open() and now - last_cycle_at >= TRADING_CYCLE_INTERVAL_SECONDS:
+        market_open = market_data_provider.is_market_open()
+        cycle_due = now - last_cycle_at >= TRADING_CYCLE_INTERVAL_SECONDS
+        run_requested = check_run_requested(core)
+
+        if run_requested and not market_open:
+            # The owner's run-now request was market-hours-gated when it was
+            # made (see NextJS_Monsta's POST /api/devices/[deviceId]/run-now),
+            # but the market can close in the gap before this device's next
+            # poll - discard rather than leave it pending until the market
+            # reopens, which would run unexpectedly with no owner action in
+            # between.
+            logger.info("run-now request received while market is closed; discarding")
+            ack_run_request(core)
+            run_requested = False
+
+        if market_open and (cycle_due or run_requested):
             try:
                 reconcile_manual_holdings(core, alpaca)
             except Exception:
@@ -263,9 +298,22 @@ def main() -> None:
             except Exception:
                 logger.exception("trading cycle failed")
                 core.events.publish(EventType.FATAL_ERROR, {"component": "trading_worker"}, severity="error")
+            if run_requested:
+                ack_run_request(core)
             last_cycle_at = now
 
         time.sleep(ACCOUNT_SNAPSHOT_INTERVAL_SECONDS)
+
+
+def main() -> None:
+    core = DeviceCore.load()
+    activation = _build_activation_client(core)
+
+    while True:
+        status = _wait_for_activation(core, activation)
+        core.events.publish(EventType.DEVICE_ACTIVATED, {"owner_ref": status.owner_ref})
+        _configure_market_data(core)
+        _run_trading_loop(core, activation)
 
 
 if __name__ == "__main__":

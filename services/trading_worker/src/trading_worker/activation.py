@@ -95,7 +95,7 @@ class HTTPActivationClient:
     def check_status(self) -> ActivationStatus:
         device = self._core.devices.get_or_create()
         if device.is_activated:
-            return ActivationStatus(activated=True, owner_ref=device.owner_ref, device_serial=device.serial)
+            return self._recheck_activated(device)
 
         if not device.has_device_token or device.pairing_code_expired:
             registered = self._register(device)
@@ -108,6 +108,59 @@ class HTTPActivationClient:
             return ActivationStatus(activated=False, device_serial=device.serial, pairing_code=device.pairing_code)
 
         return self._poll(device)
+
+    def _recheck_activated(self, device: Device) -> ActivationStatus:
+        """Called on every check_status() while locally activated -
+        re-verifies with monstra.pro rather than trusting the local flag
+        forever, closing the gap where a website-side disconnect (which
+        revokes this device's bearer token - see NextJS_Monsta's
+        POST /api/devices/[deviceId]/disconnect) would otherwise never reach
+        an already-running trading_worker; main.py calls check_status() on
+        every trading-loop tick (ACCOUNT_SNAPSHOT_INTERVAL_SECONDS - 60s by
+        default) specifically so this recheck actually happens periodically,
+        not just once at startup.
+
+        A revoked token gets a definitive 401 - that is the only outcome
+        (along with the server explicitly reporting `activated: false`) that
+        deactivates locally. Any other failure (timeout, DNS, 5xx) is
+        treated as a transient blip and leaves the device activated,
+        matching this module's "waiting is a safe fallback" philosophy
+        elsewhere (see this class's own docstring).
+        """
+        token = self._core.devices.get_device_token()
+        if token is None:
+            logger.warning("locally activated device has no token; deactivating")
+            deactivated = self._core.devices.deactivate()
+            return ActivationStatus(activated=False, device_serial=deactivated.serial)
+
+        try:
+            response = self._session.get(
+                f"{self._core.config.monstra_pro_api_url}/api/devices/status",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=self._timeout_seconds,
+            )
+        except Exception:
+            logger.warning("activation recheck failed (network); assuming still activated", exc_info=True)
+            return ActivationStatus(activated=True, owner_ref=device.owner_ref, device_serial=device.serial)
+
+        if response.status_code == 401:
+            logger.warning("device token revoked by monstra.pro; deactivating locally")
+            deactivated = self._core.devices.deactivate()
+            return ActivationStatus(activated=False, device_serial=deactivated.serial)
+
+        try:
+            response.raise_for_status()
+            body = response.json()
+        except Exception:
+            logger.warning("activation recheck failed (non-401 error); assuming still activated", exc_info=True)
+            return ActivationStatus(activated=True, owner_ref=device.owner_ref, device_serial=device.serial)
+
+        if not body.get("activated"):
+            logger.warning("monstra.pro no longer reports this device as activated; deactivating locally")
+            deactivated = self._core.devices.deactivate()
+            return ActivationStatus(activated=False, device_serial=deactivated.serial)
+
+        return ActivationStatus(activated=True, owner_ref=device.owner_ref, device_serial=device.serial)
 
     def _register(self, device: Device) -> Device | None:
         try:

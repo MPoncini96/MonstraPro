@@ -117,6 +117,28 @@ class DeviceRepository:
             session.flush()
             return _from_row(row)
 
+    def deactivate(self) -> Device:
+        """Clears local activation state after a periodic HTTPActivationClient
+        recheck confirms monstra.pro no longer considers this device paired
+        (e.g. the owner disconnected it from the website - see
+        NextJS_Monsta's POST /api/devices/[deviceId]/disconnect, which revokes
+        this device's bearer token). Also clears the now-dead token and any
+        stale pairing code so the next check_status() call re-registers from
+        scratch and gets a fresh token + pairing code, exactly like a
+        never-yet-activated device - mirroring that disconnect route's own
+        docstring ("free to be paired again")."""
+        with self._db.session() as session:
+            row = session.query(DeviceRow).order_by(DeviceRow.id.asc()).first()
+            if row is None:
+                raise ValueError("Device has not been created yet; call get_or_create() first")
+            row.activated_at = None
+            row.owner_ref = None
+            row.device_token_encrypted = None
+            row.pairing_code = None
+            row.pairing_code_expires_at = None
+            session.flush()
+            return _from_row(row)
+
     def store_registration(
         self, *, device_token: str, pairing_code: str, pairing_code_expires_at: datetime
     ) -> Device:

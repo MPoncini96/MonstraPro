@@ -137,14 +137,20 @@ def test_http_client_activates_locally_once_server_confirms(core):
     assert reloaded.is_activated is True
 
 
-def test_http_client_short_circuits_without_any_network_call_once_locally_activated(core):
-    """Regression guard: an already-activated device must not need network
-    access just to confirm what it already durably knows - otherwise a
-    transient Wi-Fi blip on restart would needlessly block an already-paired
-    device from starting its trading loop."""
+def test_http_client_rechecks_with_server_even_once_locally_activated(core):
+    """A website-side disconnect (NextJS_Monsta's
+    POST /api/devices/[deviceId]/disconnect) must reach an already-running
+    device, not just a freshly-restarted one - so check_status() re-verifies
+    with monstra.pro on every call rather than trusting the local activated
+    flag forever."""
     core.devices.get_or_create()
     core.devices.activate(owner_ref="cust_123")
-    session = _FakeSession()  # any post()/get() call raises AssertionError - none queued
+    core.devices.store_registration(
+        device_token="mpb_live_still-good",
+        pairing_code=None,
+        pairing_code_expires_at=datetime.now(timezone.utc) + timedelta(minutes=15),
+    )
+    session = _FakeSession(status_responses=[_FakeResponse(200, {"activated": True, "ownerLinked": True})])
     client = HTTPActivationClient(core, session=session)
 
     status = client.check_status()
@@ -152,6 +158,80 @@ def test_http_client_short_circuits_without_any_network_call_once_locally_activa
     assert status.activated is True
     assert status.owner_ref == "cust_123"
     assert session.register_calls == []
+    assert len(session.status_calls) == 1
+
+
+def test_http_client_recheck_network_failure_does_not_deactivate(core):
+    """A transient Wi-Fi blip must not itself kick an already-paired device
+    offline - only a definitive server signal (401, or an explicit
+    `activated: false`) does that. See _recheck_activated's docstring."""
+    core.devices.get_or_create()
+    core.devices.activate(owner_ref="cust_123")
+    core.devices.store_registration(
+        device_token="mpb_live_still-good",
+        pairing_code=None,
+        pairing_code_expires_at=datetime.now(timezone.utc) + timedelta(minutes=15),
+    )
+    session = _FakeSession(status_responses=[requests.ConnectionError("network down")])
+    client = HTTPActivationClient(core, session=session)
+
+    status = client.check_status()
+
+    assert status.activated is True
+    assert core.devices.get().is_activated is True
+
+
+def test_http_client_recheck_401_deactivates_locally(core):
+    """A revoked token (owner disconnected the device from monstra.pro) gets
+    a definitive 401 from /api/devices/status - that must deactivate the
+    device locally, and clear its now-dead token so the next check_status()
+    call registers fresh, exactly like a never-yet-activated device."""
+    core.devices.get_or_create()
+    core.devices.activate(owner_ref="cust_123")
+    core.devices.store_registration(
+        device_token="mpb_live_revoked",
+        pairing_code=None,
+        pairing_code_expires_at=datetime.now(timezone.utc) + timedelta(minutes=15),
+    )
+    session = _FakeSession(status_responses=[_FakeResponse(401)])
+    client = HTTPActivationClient(core, session=session)
+
+    status = client.check_status()
+
+    assert status.activated is False
+    reloaded = core.devices.get()
+    assert reloaded.is_activated is False
+    assert reloaded.owner_ref is None
+    assert reloaded.has_device_token is False
+
+
+def test_http_client_recheck_explicit_activated_false_deactivates(core):
+    session_device_token = "mpb_live_still-good"
+    core.devices.get_or_create()
+    core.devices.activate(owner_ref="cust_123")
+    core.devices.store_registration(
+        device_token=session_device_token,
+        pairing_code=None,
+        pairing_code_expires_at=datetime.now(timezone.utc) + timedelta(minutes=15),
+    )
+    session = _FakeSession(status_responses=[_FakeResponse(200, {"activated": False, "ownerLinked": False})])
+    client = HTTPActivationClient(core, session=session)
+
+    status = client.check_status()
+
+    assert status.activated is False
+    assert core.devices.get().is_activated is False
+
+
+def test_http_client_recheck_with_no_token_deactivates_without_network_call(core):
+    core.devices.get_or_create()
+    core.devices.activate(owner_ref="cust_123")
+    session = _FakeSession()  # any post()/get() call raises AssertionError - none queued
+    client = HTTPActivationClient(core, session=session)
+
+    status = client.check_status()
+
+    assert status.activated is False
     assert session.status_calls == []
 
 

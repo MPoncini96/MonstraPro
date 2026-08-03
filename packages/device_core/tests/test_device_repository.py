@@ -181,6 +181,34 @@ def test_pairing_code_expired_is_true_when_no_code_has_ever_been_issued(config):
     assert device.pairing_code_expired is True
 
 
+def test_deactivate_clears_activation_and_token(config):
+    """Regression guard for the website-disconnect recheck (see
+    trading_worker.activation.HTTPActivationClient._recheck_activated):
+    clearing the token too means the next check_status() call registers
+    fresh and gets a new pairing code, exactly like a never-yet-activated
+    device - not stuck with a dead token and no way back in."""
+    _, repo = _repo(config)
+    repo.get_or_create()
+    repo.store_registration(
+        device_token="mpb_live_abc.secret",
+        pairing_code="ABCD1234",
+        pairing_code_expires_at=datetime.now(timezone.utc) + timedelta(minutes=15),
+    )
+    repo.activate(owner_ref="cust_123")
+
+    deactivated = repo.deactivate()
+
+    assert deactivated.is_activated is False
+    assert deactivated.owner_ref is None
+    assert deactivated.has_device_token is False
+    assert deactivated.pairing_code is None
+    assert deactivated.pairing_code_expires_at is None
+
+    reloaded = repo.get()
+    assert reloaded.is_activated is False
+    assert reloaded.has_device_token is False
+
+
 def test_pairing_code_expired_reflects_the_stored_expiry(config):
     _, repo = _repo(config)
     repo.get_or_create()

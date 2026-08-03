@@ -1,3 +1,4 @@
+import trading_worker.main as main_module
 from trading_worker.activation import ActivationStatus
 from trading_worker.main import _record_snapshots, _wait_for_activation
 
@@ -182,3 +183,112 @@ def test_wait_for_activation_stops_at_max_polls_while_still_unactivated(core):
 
     assert status.activated is False
     assert activation.calls == 2
+
+
+class _ScriptedActivationClient:
+    """Returns each ActivationStatus in `statuses` in order, one per
+    check_status() call - lets a test script exactly when a periodic
+    recheck flips to deactivated, unlike _FakeActivationClient's
+    monotonic not-then-activated shape."""
+
+    def __init__(self, statuses):
+        self._statuses = list(statuses)
+        self.calls = 0
+
+    def check_status(self):
+        self.calls += 1
+        if not self._statuses:
+            raise AssertionError("check_status called more times than the test expected")
+        return self._statuses.pop(0)
+
+
+def _fail(message):
+    def _raiser(*args, **kwargs):
+        raise AssertionError(message)
+
+    return _raiser
+
+
+def test_run_trading_loop_exits_immediately_when_first_recheck_is_deactivated(core, monkeypatch):
+    """If the very first recheck already reports deactivated (e.g. the
+    device was disconnected right as it entered the trading loop),
+    _run_trading_loop must return without touching Alpaca at all."""
+    activation = _ScriptedActivationClient([ActivationStatus(activated=False, device_serial="MPB-TEST")])
+    monkeypatch.setattr(main_module, "_build_alpaca_client", _fail("must not build an Alpaca client once deactivated"))
+
+    main_module._run_trading_loop(core, activation)
+
+    assert activation.calls == 1
+
+
+def test_run_trading_loop_returns_once_recheck_reports_deactivated(core, monkeypatch):
+    """The core regression this feature closes: a website-side disconnect
+    (POST /api/devices/[deviceId]/disconnect) must stop an already-running
+    trading loop on its next recheck, not just block a future restart."""
+    activation = _ScriptedActivationClient(
+        [
+            ActivationStatus(activated=True, owner_ref="cust_123", device_serial="MPB-TEST"),
+            ActivationStatus(activated=False, device_serial="MPB-TEST"),
+        ]
+    )
+    sleeps: list[float] = []
+    monkeypatch.setattr(main_module.time, "sleep", sleeps.append)
+    monkeypatch.setattr(main_module, "_build_alpaca_client", lambda core: object())
+    monkeypatch.setattr(main_module, "_record_snapshots", lambda core, alpaca: None)
+    monkeypatch.setattr(main_module.market_data_provider, "is_market_open", lambda: False)
+    monkeypatch.setattr(main_module, "check_run_requested", lambda core: False)
+
+    main_module._run_trading_loop(core, activation)
+
+    assert activation.calls == 2
+    assert len(sleeps) == 1  # slept once, after the first (still-activated) tick
+
+
+def test_run_trading_loop_runs_immediately_on_run_request_even_if_cycle_not_due(core, monkeypatch):
+    activation = _ScriptedActivationClient(
+        [
+            ActivationStatus(activated=True, device_serial="MPB-TEST"),
+            ActivationStatus(activated=False, device_serial="MPB-TEST"),
+        ]
+    )
+    monkeypatch.setattr(main_module.time, "sleep", lambda _: None)
+    monkeypatch.setattr(main_module, "_build_alpaca_client", lambda core: object())
+    monkeypatch.setattr(main_module, "_record_snapshots", lambda core, alpaca: None)
+    monkeypatch.setattr(main_module.market_data_provider, "is_market_open", lambda: True)
+    monkeypatch.setattr(main_module, "check_run_requested", lambda core: True)
+    acked = []
+    monkeypatch.setattr(main_module, "ack_run_request", lambda core: acked.append(True))
+    ran: list[str] = []
+    monkeypatch.setattr(main_module, "reconcile_manual_holdings", lambda core, alpaca: ran.append("reconcile"))
+    monkeypatch.setattr(main_module, "run_cycle", lambda core, alpaca: ran.append("cycle"))
+
+    main_module._run_trading_loop(core, activation)
+
+    assert ran == ["reconcile", "cycle"]
+    assert acked == [True]
+
+
+def test_run_trading_loop_discards_run_request_when_market_closed(core, monkeypatch):
+    """A run-now request is market-hours-gated when made (see
+    NextJS_Monsta's POST /api/devices/[deviceId]/run-now), but the market
+    can close before this device polls - it must discard the stale request
+    rather than run it (or leave it pending until the market reopens)."""
+    activation = _ScriptedActivationClient(
+        [
+            ActivationStatus(activated=True, device_serial="MPB-TEST"),
+            ActivationStatus(activated=False, device_serial="MPB-TEST"),
+        ]
+    )
+    monkeypatch.setattr(main_module.time, "sleep", lambda _: None)
+    monkeypatch.setattr(main_module, "_build_alpaca_client", lambda core: object())
+    monkeypatch.setattr(main_module, "_record_snapshots", lambda core, alpaca: None)
+    monkeypatch.setattr(main_module.market_data_provider, "is_market_open", lambda: False)
+    monkeypatch.setattr(main_module, "check_run_requested", lambda core: True)
+    acked = []
+    monkeypatch.setattr(main_module, "ack_run_request", lambda core: acked.append(True))
+    monkeypatch.setattr(main_module, "reconcile_manual_holdings", _fail("must not run while market is closed"))
+    monkeypatch.setattr(main_module, "run_cycle", _fail("must not run while market is closed"))
+
+    main_module._run_trading_loop(core, activation)
+
+    assert acked == [True]  # discarded, not left pending until the market reopens
