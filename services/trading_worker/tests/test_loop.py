@@ -183,6 +183,32 @@ def test_all_target_symbols_locked_skips_rebalance_entirely(core, monkeypatch):
     assert core.allocations.latest("force") is None
 
 
+def test_runner_lookup_uses_bot_type_not_bot_slug_when_present(core, monkeypatch):
+    """Real monstra.pro-synced rows store bot_slug as a per-instance monster
+    identity (e.g. "vectura_draco") separate from bot_type (the engine
+    family, "draco") - the registry lookup must use bot_type, not bot_slug,
+    once bot_type is set."""
+    core.strategies.upsert(bot_slug="vectura_draco", bot_type="draco", params={}, source="monstra.pro")
+    _patch_registry(monkeypatch, {"draco": lambda config, state: _signal("vectura_draco", signal="HOLD")})
+    alpaca = FakeAlpacaClient()
+
+    results = run_cycle(core, alpaca)
+
+    assert results == [{"bot_slug": "vectura_draco", "signal": "HOLD", "orders": []}]
+
+
+def test_runner_lookup_falls_back_to_bot_slug_when_bot_type_is_none(core, monkeypatch):
+    """Locally/test-seeded rows predating bot_selection_sync never set
+    bot_type - bot_slug itself must still resolve as the engine slug."""
+    core.strategies.upsert(bot_slug="force", params={})  # no bot_type
+    _patch_registry(monkeypatch, {"force": lambda config, state: _signal("force", signal="HOLD")})
+    alpaca = FakeAlpacaClient()
+
+    results = run_cycle(core, alpaca)
+
+    assert results == [{"bot_slug": "force", "signal": "HOLD", "orders": []}]
+
+
 def test_locked_value_is_excluded_from_manageable_equity(core, monkeypatch):
     """400 of the account's 1000 equity is a locked TSLA position - the bot
     should size its AAPL buy against the remaining 600, not the full 1000."""

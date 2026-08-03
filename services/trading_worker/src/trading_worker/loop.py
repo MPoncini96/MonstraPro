@@ -26,18 +26,15 @@ first place (buying up to target_qty) is a separate, one-directional
 code path - see trading_worker/manual_holdings.py's
 reconcile_manual_holdings, the only thing allowed to trade a locked symbol.
 
-Known gap: `_run_one_bot` below looks up the strategy_engine runner via
-`get_algorithm(bot_slug)`/`get_runner(bot_slug)`, i.e. it assumes
-strategy_config.bot_slug IS one of the three engine slugs ("force"/
-"aptet"/"draco"). NextJS_Monsta's bot-picker (Track B2) actually persists
-`bot_slug` as a specific monster variation's slug (e.g. "vectura_draco",
-the per-instance identity for signal/state/order tracking) with a
-*separate* `botType` field carrying the engine - see
-services/updater/src/updater/manifest_client.py's module docstring. Once
-whatever provisions local strategy_config rows from that data exists, this
-needs to route via a stored engine/algorithm_slug field instead of
-bot_slug directly. Not fixed yet because nothing populates strategy_config
-from real B-side data today - tracked here rather than silently wrong.
+`_run_one_bot` below looks up the strategy_engine runner via
+`get_algorithm(bot_type or bot_slug)`/`get_runner(...)` - `bot_type`
+("force"/"aptet"/"draco", the engine family) is a separate field from
+`bot_slug` (a specific monster variation's slug, e.g. "vectura_draco", the
+per-instance identity used for signal/state/order tracking below), synced
+from monstra.pro by trading_worker/bot_selection_sync.py. Falls back to
+treating bot_slug itself as the engine slug when bot_type is None, for
+rows that predate that sync (local/test-seeded strategy_config rows where
+bot_slug already IS one of the three engine slugs directly).
 """
 
 from __future__ import annotations
@@ -60,14 +57,23 @@ def _run_one_bot(
     alpaca: AlpacaClient,
     *,
     bot_slug: str,
+    bot_type: str | None = None,
     params: dict[str, Any],
     equity_history: list[float],
     locked_symbols: set[str],
 ) -> dict[str, Any]:
-    algorithm = get_algorithm(bot_slug)
-    runner = get_runner(bot_slug) if algorithm is not None else None
+    # bot_type (force/aptet/draco) is the engine family - bot_slug is only
+    # the per-instance identity (e.g. "vectura_draco") used for signal/
+    # state/order tracking below. Falls back to bot_slug when bot_type is
+    # None (locally/test-seeded rows predating bot_selection_sync.py, where
+    # bot_slug already IS one of the three engine slugs directly).
+    engine_slug = bot_type or bot_slug
+    algorithm = get_algorithm(engine_slug)
+    runner = get_runner(engine_slug) if algorithm is not None else None
     if runner is None:
-        raise ValueError(f"No strategy_engine runner registered for bot_slug={bot_slug!r}")
+        raise ValueError(
+            f"No strategy_engine runner registered for bot_slug={bot_slug!r} bot_type={bot_type!r}"
+        )
 
     config = {**params, "bot_id": bot_slug, "equity_history": equity_history}
     prior_state = core.bot_states.get(bot_slug)
@@ -161,6 +167,7 @@ def run_cycle(core: DeviceCore, alpaca: AlpacaClient) -> list[dict[str, Any]]:
                 core,
                 alpaca,
                 bot_slug=bot_slug,
+                bot_type=row.get("bot_type"),
                 params=row.get("params_json") or {},
                 equity_history=equity_history,
                 locked_symbols=locked_symbols,

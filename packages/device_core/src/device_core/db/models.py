@@ -124,6 +124,13 @@ class StrategyConfig(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     bot_slug: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    # Engine family ("force"/"aptet"/"draco" - strategy_engine.registry's
+    # ALGORITHM_REGISTRY slugs), separate from bot_slug because monstra.pro's
+    # bot_slug is a per-instance monster identity (e.g. "vectura_draco"), not
+    # the engine itself - see trading_worker/loop.py's _run_one_bot, which
+    # looks up get_algorithm()/get_runner() by this field (falling back to
+    # bot_slug when None, for rows never synced from monstra.pro).
+    bot_type: Mapped[str | None] = mapped_column(String(32))
     display_name: Mapped[str | None] = mapped_column(String(128))
     params_json: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     target_allocation_json: Mapped[dict[str, Any] | None] = mapped_column(JSON)

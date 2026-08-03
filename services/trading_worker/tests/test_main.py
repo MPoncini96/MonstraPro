@@ -268,6 +268,48 @@ def test_run_trading_loop_runs_immediately_on_run_request_even_if_cycle_not_due(
     assert acked == [True]
 
 
+def test_run_trading_loop_syncs_bot_selections_every_tick(core, monkeypatch):
+    activation = _ScriptedActivationClient(
+        [
+            ActivationStatus(activated=True, device_serial="MPB-TEST"),
+            ActivationStatus(activated=True, device_serial="MPB-TEST"),
+            ActivationStatus(activated=False, device_serial="MPB-TEST"),
+        ]
+    )
+    monkeypatch.setattr(main_module.time, "sleep", lambda _: None)
+    monkeypatch.setattr(main_module, "_build_alpaca_client", lambda core: object())
+    monkeypatch.setattr(main_module, "_record_snapshots", lambda core, alpaca: None)
+    monkeypatch.setattr(main_module.market_data_provider, "is_market_open", lambda: False)
+    monkeypatch.setattr(main_module, "check_run_requested", lambda core: False)
+    sync_calls = []
+    monkeypatch.setattr(main_module, "sync_bot_selections", lambda core: sync_calls.append(True))
+
+    main_module._run_trading_loop(core, activation)
+
+    assert len(sync_calls) == 2  # once per still-activated tick
+
+
+def test_run_trading_loop_survives_bot_selection_sync_raising(core, monkeypatch):
+    """A bug in the sync call (or a raised exception it doesn't itself
+    catch) must not take down the whole trading loop."""
+    activation = _ScriptedActivationClient(
+        [
+            ActivationStatus(activated=True, device_serial="MPB-TEST"),
+            ActivationStatus(activated=False, device_serial="MPB-TEST"),
+        ]
+    )
+    monkeypatch.setattr(main_module.time, "sleep", lambda _: None)
+    monkeypatch.setattr(main_module, "_build_alpaca_client", lambda core: object())
+    monkeypatch.setattr(main_module, "_record_snapshots", lambda core, alpaca: None)
+    monkeypatch.setattr(main_module.market_data_provider, "is_market_open", lambda: False)
+    monkeypatch.setattr(main_module, "check_run_requested", lambda core: False)
+    monkeypatch.setattr(main_module, "sync_bot_selections", _fail("boom"))
+
+    main_module._run_trading_loop(core, activation)  # must not raise
+
+    assert activation.calls == 2
+
+
 def test_run_trading_loop_discards_run_request_when_market_closed(core, monkeypatch):
     """A run-now request is market-hours-gated when made (see
     NextJS_Monsta's POST /api/devices/[deviceId]/run-now), but the market

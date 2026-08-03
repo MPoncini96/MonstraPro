@@ -27,6 +27,14 @@ Responsibilities (see ARCHITECTURE.md section 4.1):
      the device-side half of the connect flow in NextJS_Monsta's
      /devices/alpaca page. Only ever touches the network while local
      credentials are missing; once synced, relies on its own local Vault.
+  3a. Every tick, bot_selection_sync.sync_bot_selections mirrors the
+     owner's website bot selections (NextJS_Monsta's
+     GET /api/devices/strategy-config) into local strategy_config rows -
+     run_cycle only ever reads from this local table, never the website's
+     database directly, so without this sync a device could have any
+     number of bots selected on monstra.pro and still run zero of them.
+     Creates/updates/deactivates only source="monstra.pro" rows; a
+     locally-configured (source="local") bot is never touched.
   4. Trading loop, per scheduled cycle (TRADING_CYCLE_INTERVAL_SECONDS) or
      immediately if the owner requested an out-of-schedule run from
      monstra.pro (NextJS_Monsta's POST /api/devices/[deviceId]/run-now,
@@ -78,6 +86,7 @@ from trading_worker.activation import (
 )
 from trading_worker.alpaca_client import AlpacaClient
 from trading_worker.alpaca_sync import sync_alpaca_credentials_if_missing
+from trading_worker.bot_selection_sync import sync_bot_selections
 from trading_worker.loop import run_cycle
 from trading_worker.manual_holdings import reconcile_manual_holdings
 from trading_worker.run_request import ack_run_request, check_run_requested
@@ -237,6 +246,12 @@ def _wait_for_activation(
 def _run_trading_loop(core: DeviceCore, activation: ActivationClient) -> None:
     """Runs snapshots + trading cycles until deactivated.
 
+    Every tick also calls bot_selection_sync.sync_bot_selections, mirroring
+    the owner's website bot selections into local strategy_config rows
+    before this tick's cycle check runs, so a bot picked (or unpicked) on
+    monstra.pro takes effect within about a minute, same cadence as
+    everything else here.
+
     Every tick also calls activation.check_status() - for HTTPActivationClient
     this re-verifies with monstra.pro rather than trusting the local
     activated flag forever (see activation.py's _recheck_activated), which is
@@ -272,6 +287,11 @@ def _run_trading_loop(core: DeviceCore, activation: ActivationClient) -> None:
             except Exception:
                 logger.exception("account snapshot poll failed")
             last_snapshot_at = now
+
+        try:
+            sync_bot_selections(core)
+        except Exception:
+            logger.exception("bot selection sync failed")
 
         market_open = market_data_provider.is_market_open()
         cycle_due = now - last_cycle_at >= TRADING_CYCLE_INTERVAL_SECONDS
