@@ -62,6 +62,19 @@ class SignalRepository:
             session.flush()
             return SignalWriteResult(id=row.id, written=True)
 
+    def as_of(self, bot_id: str, bot_type: str, ts: datetime) -> dict[str, Any] | None:
+        """Most recent row for (bot_id, bot_type) at or before `ts` - what
+        this bot's recorded signal was as of a past cycle, for offline
+        cycle-replay auditing (trading_worker.audit)."""
+        with self._db.session() as session:
+            row = (
+                session.query(Signal)
+                .filter(Signal.bot_id == bot_id, Signal.bot_type == bot_type, Signal.ts <= ts)
+                .order_by(Signal.ts.desc(), Signal.id.desc())
+                .first()
+            )
+            return _row_to_dict(row) if row is not None else None
+
     def latest(self, bot_id: str, bot_type: str) -> dict[str, Any] | None:
         with self._db.session() as session:
             row = (

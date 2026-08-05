@@ -73,3 +73,18 @@ class OrderRepository:
                 query = query.filter_by(bot_slug=bot_slug)
             rows = query.order_by(Order.id.desc()).limit(limit).all()
             return [_row_to_dict(row) for row in rows]
+
+    def in_window(
+        self, *, start: datetime, end: datetime, bot_slug: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Orders submitted within [start, end] - for offline cycle-replay
+        auditing (trading_worker.audit), where a cycle's orders are
+        correlated to it by proximity to that cycle's account_snapshot
+        timestamp rather than a direct foreign key (Order has none - see
+        loop.py's module docstring)."""
+        with self._db.session() as session:
+            query = session.query(Order).filter(Order.submitted_at >= start, Order.submitted_at <= end)
+            if bot_slug is not None:
+                query = query.filter_by(bot_slug=bot_slug)
+            rows = query.order_by(Order.submitted_at.asc(), Order.id.asc()).all()
+            return [_row_to_dict(row) for row in rows]

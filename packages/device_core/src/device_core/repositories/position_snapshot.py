@@ -75,6 +75,28 @@ class PositionSnapshotRepository:
                 result.setdefault(data["symbol"], data)  # first hit per symbol is the newest (desc order)
             return result
 
+    def as_of(self, ts: datetime) -> dict[str, dict[str, Any]]:
+        """Most recent row per symbol at or before `ts` - the historical
+        counterpart to latest_by_symbol() (which is always relative to
+        "now"), used to reconstruct what positions looked like during a
+        past trading cycle for offline cycle-replay auditing
+        (trading_worker.audit). Unlike latest_by_symbol(), this has no
+        recency window - a symbol closed long before `ts` still isn't
+        "current" as of `ts`, but the caller decides that from `qty`/
+        `market_value`, not by this method silently dropping the row."""
+        with self._db.session() as session:
+            rows = (
+                session.query(PositionSnapshot)
+                .filter(PositionSnapshot.ts <= ts)
+                .order_by(PositionSnapshot.ts.desc(), PositionSnapshot.id.desc())
+                .all()
+            )
+            result: dict[str, dict[str, Any]] = {}
+            for row in rows:
+                data = _row_to_dict(row)
+                result.setdefault(data["symbol"], data)  # first hit per symbol is the newest (desc order)
+            return result
+
     def history(self, symbol: str, *, limit: int = 400) -> list[dict[str, Any]]:
         """Most-recent-first, matching AccountSnapshotRepository.recent()'s
         shape/ordering convention."""

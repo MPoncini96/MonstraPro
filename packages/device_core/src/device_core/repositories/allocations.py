@@ -8,6 +8,7 @@ and the previous latest() reading is left untouched.
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 from device_core.db.models import PortfolioAllocation
@@ -56,6 +57,19 @@ class PortfolioAllocationRepository:
             row = (
                 session.query(PortfolioAllocation)
                 .filter_by(bot_slug=bot_slug)
+                .order_by(PortfolioAllocation.ts.desc(), PortfolioAllocation.id.desc())
+                .first()
+            )
+            return _row_to_dict(row) if row is not None else None
+
+    def as_of(self, bot_slug: str, ts: datetime) -> dict[str, Any] | None:
+        """Most recent row for bot_slug at or before `ts` - reconstructs what
+        loop.py's _last_known_allocation would have returned for a past
+        cycle, for offline cycle-replay auditing (trading_worker.audit)."""
+        with self._db.session() as session:
+            row = (
+                session.query(PortfolioAllocation)
+                .filter(PortfolioAllocation.bot_slug == bot_slug, PortfolioAllocation.ts <= ts)
                 .order_by(PortfolioAllocation.ts.desc(), PortfolioAllocation.id.desc())
                 .first()
             )

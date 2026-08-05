@@ -1,3 +1,6 @@
+from datetime import datetime, timedelta, timezone
+
+from device_core.db.models import AccountSnapshot
 from device_core.db.session import Database
 from device_core.repositories.account_snapshot import AccountSnapshotRepository
 
@@ -32,3 +35,24 @@ def test_recent_respects_limit(config):
         repo.record(equity=float(i), cash=0.0)
 
     assert len(repo.recent(limit=2)) == 2
+
+
+def test_equity_history_as_of_only_includes_rows_at_or_before_ts(config):
+    """For trading_worker.audit's algorithm-fidelity replay: a replayed past
+    cycle must see the equity_history it actually had, not rows recorded
+    after it."""
+    db = Database(config)
+    repo = AccountSnapshotRepository(db)
+
+    old_id = repo.record(equity=100.0, cash=10.0)
+    with db.session() as session:
+        row = session.query(AccountSnapshot).filter_by(id=old_id).one()
+        row.ts = datetime.now(timezone.utc) - timedelta(hours=1)
+
+    repo.record(equity=110.0, cash=5.0)
+
+    as_of_between = repo.equity_history_as_of(datetime.now(timezone.utc) - timedelta(minutes=30))
+    assert as_of_between == [100.0]
+
+    as_of_now = repo.equity_history_as_of(datetime.now(timezone.utc))
+    assert as_of_now == [110.0, 100.0]

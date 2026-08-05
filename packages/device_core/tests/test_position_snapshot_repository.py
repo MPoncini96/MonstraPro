@@ -73,3 +73,27 @@ def test_history_respects_limit(config):
     history = repo.history("AAPL", limit=2)
 
     assert len(history) == 2
+
+
+def test_as_of_returns_most_recent_row_per_symbol_at_or_before_ts(config):
+    """For trading_worker.audit's execution-fidelity replay: as_of() must
+    reconstruct what positions looked like at a past cycle, not "currently
+    held" (unlike latest_by_symbol(), it has no recency window)."""
+    db = Database(config)
+    repo = PositionSnapshotRepository(db)
+
+    old_id = _record(repo, symbol="AAPL", current_price=150.0)
+    with db.session() as session:
+        row = session.query(PositionSnapshot).filter_by(id=old_id).one()
+        row.ts = datetime.now(timezone.utc) - timedelta(hours=1)
+
+    _record(repo, symbol="AAPL", current_price=160.0)
+    _record(repo, symbol="MSFT", current_price=300.0)
+
+    as_of_between = repo.as_of(datetime.now(timezone.utc) - timedelta(minutes=30))
+    assert as_of_between["AAPL"]["current_price"] == 150.0
+    assert "MSFT" not in as_of_between  # MSFT's only row is after this ts
+
+    as_of_now = repo.as_of(datetime.now(timezone.utc))
+    assert as_of_now["AAPL"]["current_price"] == 160.0
+    assert as_of_now["MSFT"]["current_price"] == 300.0

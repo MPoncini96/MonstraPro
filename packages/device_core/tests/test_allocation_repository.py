@@ -1,5 +1,8 @@
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
+from device_core.db.models import PortfolioAllocation
 from device_core.db.session import Database
 from device_core.repositories.allocations import InvalidAllocationError, PortfolioAllocationRepository
 
@@ -48,3 +51,33 @@ def test_history_orders_newest_first(config):
 
     history = repo.history("alpha1")
     assert [row["target_weights_json"] for row in history] == [{"MSFT": 1.0}, {"AAPL": 1.0}]
+
+
+def test_as_of_returns_the_row_in_effect_at_a_past_cycle(config):
+    """For trading_worker.audit's execution-fidelity replay: as_of() must
+    return whatever was the LATEST allocation at or before the given
+    timestamp, not simply the newest row overall."""
+    db = Database(config)
+    repo = PortfolioAllocationRepository(db)
+
+    old = repo.replace(bot_slug="alpha1", target_weights={"AAPL": 1.0}, current_weights={})
+    with db.session() as session:
+        row = session.query(PortfolioAllocation).filter_by(id=old["id"]).one()
+        row.ts = datetime.now(timezone.utc) - timedelta(hours=1)
+
+    repo.replace(bot_slug="alpha1", target_weights={"MSFT": 1.0}, current_weights={})
+
+    as_of_between = repo.as_of("alpha1", datetime.now(timezone.utc) - timedelta(minutes=30))
+    assert as_of_between["target_weights_json"] == {"AAPL": 1.0}
+
+    as_of_now = repo.as_of("alpha1", datetime.now(timezone.utc))
+    assert as_of_now["target_weights_json"] == {"MSFT": 1.0}
+
+
+def test_as_of_returns_none_when_no_row_existed_yet(config):
+    db = Database(config)
+    repo = PortfolioAllocationRepository(db)
+
+    repo.replace(bot_slug="alpha1", target_weights={"AAPL": 1.0}, current_weights={})
+
+    assert repo.as_of("alpha1", datetime.now(timezone.utc) - timedelta(days=1)) is None

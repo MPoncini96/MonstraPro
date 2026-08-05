@@ -8,6 +8,7 @@ breaker (config["equity_history"]).
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 from device_core.db.models import AccountSnapshot
@@ -43,3 +44,18 @@ class AccountSnapshotRepository:
 
     def equity_history(self, *, limit: int = 400) -> list[float]:
         return [row["equity"] for row in self.recent(limit=limit)]
+
+    def equity_history_as_of(self, ts: datetime, *, limit: int = 400) -> list[float]:
+        """equity_history(), but only rows recorded at or before `ts` - the
+        equity_history a replayed past cycle would actually have seen as
+        its config["equity_history"] input, for offline cycle-replay
+        auditing (trading_worker.audit)."""
+        with self._db.session() as session:
+            rows = (
+                session.query(AccountSnapshot)
+                .filter(AccountSnapshot.ts <= ts)
+                .order_by(AccountSnapshot.ts.desc(), AccountSnapshot.id.desc())
+                .limit(limit)
+                .all()
+            )
+            return [row.equity for row in rows]
