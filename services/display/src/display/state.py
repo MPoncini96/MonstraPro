@@ -49,7 +49,7 @@ from datetime import datetime, timedelta
 from enum import StrEnum
 from typing import Any
 
-TRADE_WAKE_DURATION_SECONDS = 30 * 60
+TRADE_WAKE_DURATION_SECONDS = 30
 NOTIFICATION_DURATION_SECONDS = 10 * 60
 
 

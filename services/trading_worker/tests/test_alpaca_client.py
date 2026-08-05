@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+
 import pytest
 
 import trading_worker.alpaca_client as alpaca_client_module
@@ -63,10 +65,38 @@ class _FakeTradingClient:
         return _FakeOrder()
 
 
+class _FakeBar:
+    def __init__(self, ts, open_, high, low, close):
+        self.timestamp = ts
+        self.open = open_
+        self.high = high
+        self.low = low
+        self.close = close
+
+
+class _FakeBarSet:
+    def __init__(self, data):
+        self.data = data
+
+
+class _FakeStockHistoricalDataClient:
+    last_request = None
+
+    def __init__(self, api_key, api_secret):
+        self.api_key = api_key
+        self.api_secret = api_secret
+
+    def get_stock_bars(self, request):
+        _FakeStockHistoricalDataClient.last_request = request
+        ts = datetime(2026, 8, 4, 10, 0, tzinfo=timezone.utc)
+        return _FakeBarSet({"AAPL": [_FakeBar(ts, "1.0", "1.1", "0.9", "1.05")]})
+
+
 @pytest.fixture(autouse=True)
 def _patch_trading_client(monkeypatch):
     _FakeTradingClient.captured_paper_flags = []
     monkeypatch.setattr(alpaca_client_module, "TradingClient", _FakeTradingClient)
+    monkeypatch.setattr(alpaca_client_module, "StockHistoricalDataClient", _FakeStockHistoricalDataClient)
 
 
 def test_paper_base_url_sets_paper_flag_true():
@@ -121,3 +151,49 @@ def test_submit_order_returns_order_result():
     assert result.alpaca_order_id == "abc-123"
     assert result.status == "accepted"
     assert result.raw == {"id": "abc-123", "status": "accepted"}
+
+
+def test_get_bars_converts_to_floats():
+    from alpaca.data.timeframe import TimeFrame
+
+    client = AlpacaClient(api_key="k", api_secret="s", base_url="https://paper-api.alpaca.markets")
+    start = datetime(2026, 8, 4, 9, 0, tzinfo=timezone.utc)
+    end = datetime(2026, 8, 4, 10, 0, tzinfo=timezone.utc)
+
+    bars = client.get_bars("AAPL", timeframe=TimeFrame.Minute, start=start, end=end)
+
+    assert len(bars) == 1
+    assert bars[0].open == pytest.approx(1.0)
+    assert bars[0].high == pytest.approx(1.1)
+    assert bars[0].low == pytest.approx(0.9)
+    assert bars[0].close == pytest.approx(1.05)
+    assert bars[0].ts == datetime(2026, 8, 4, 10, 0, tzinfo=timezone.utc)
+
+
+def test_get_bars_returns_empty_list_for_unknown_symbol():
+    from alpaca.data.timeframe import TimeFrame
+
+    client = AlpacaClient(api_key="k", api_secret="s", base_url="https://paper-api.alpaca.markets")
+    start = datetime(2026, 8, 4, 9, 0, tzinfo=timezone.utc)
+    end = datetime(2026, 8, 4, 10, 0, tzinfo=timezone.utc)
+
+    assert client.get_bars("NOSYMBOL", timeframe=TimeFrame.Minute, start=start, end=end) == []
+
+
+def test_get_bars_builds_request_with_given_symbol_timeframe_and_window():
+    from alpaca.data.timeframe import TimeFrame
+
+    client = AlpacaClient(api_key="k", api_secret="s", base_url="https://paper-api.alpaca.markets")
+    start = datetime(2026, 8, 4, 9, 0, tzinfo=timezone.utc)
+    end = datetime(2026, 8, 4, 10, 0, tzinfo=timezone.utc)
+
+    client.get_bars("AAPL", timeframe=TimeFrame.Day, start=start, end=end, limit=5)
+
+    request = _FakeStockHistoricalDataClient.last_request
+    assert request.symbol_or_symbols == "AAPL"
+    assert request.timeframe.value == TimeFrame.Day.value
+    # StockBarsRequest's pydantic validation strips tzinfo internally -
+    # compare naive equivalents rather than the exact tz-aware inputs.
+    assert request.start == start.replace(tzinfo=None)
+    assert request.end == end.replace(tzinfo=None)
+    assert request.limit == 5

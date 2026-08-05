@@ -11,8 +11,10 @@ Responsibilities (see ARCHITECTURE.md section 4.2):
      banner.
   3. While idle, rotate through three sub-views on a fixed cadence
      (idle_rotation.py: 15s portfolio candlestick + last trade, 15s a
-     rotating active bot's performance, 10s a rotating top-mover stock's
-     price) - see _render_idle below.
+     rotating active bot's signals/recent trades (no chart), 10s a
+     rotating (symbol, slide) combination - trading_worker.stock_bar_sync
+     selects the 5 tracked symbols, each shown across 3 slides: last hour /
+     last trading day / last year) - see _render_idle below.
 
 Has no direct dependency on trading_worker internals — everything comes
 through device_core.events/repositories, so display can crash or be
@@ -34,7 +36,7 @@ from display.pygame_renderer import PygameRenderer
 from display.renderer import Renderer
 from display.snapshot import build_snapshot
 from display.state import ScreenState, StateMachine
-from display.stock_view import build_stock_view, top_movers
+from display.stock_view import SLIDES, build_stock_view, selected_symbols
 
 logger = logging.getLogger(__name__)
 
@@ -66,13 +68,15 @@ def _render_idle(core: DeviceCore, renderer: Renderer, *, now: datetime, banner:
         # view rather than rendering an empty/broken bot screen.
 
     if rotation.phase == IdlePhase.STOCK:
-        symbols = top_movers(core)
+        symbols = selected_symbols(core)
         if symbols:
-            symbol = symbols[rotation.cycle_index % len(symbols)]
-            renderer.render_idle_stock(build_stock_view(core, symbol), banner, local_pin=local_pin)
+            combos = [(symbol, slide) for symbol in symbols for slide in SLIDES]
+            symbol, slide = combos[rotation.cycle_index % len(combos)]
+            renderer.render_idle_stock(build_stock_view(core, symbol, slide), banner, local_pin=local_pin)
             return
-        # No currently-held positions to rank yet - fall through to the
-        # portfolio view for the same reason as above.
+        # trading_worker.stock_bar_sync hasn't selected/cached anything yet
+        # (e.g. no Alpaca positions, or the device only just activated) -
+        # fall through to the portfolio view for the same reason as above.
 
     snapshot = build_snapshot(core, now=now)
     last_trade = build_last_trade(core)

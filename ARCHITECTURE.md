@@ -390,11 +390,11 @@ rewrite. V1 tables:
 | `order` | Every order submitted to Alpaca: id, symbol, side, qty/notional, status, timestamps, raw response. |
 | `execution_log` | Structured application log persisted for support/debugging, independent of journald retention. |
 | `account_snapshot` | Equity/cash snapshots, ~1/minute — `display`'s portfolio candlestick chart, draco's circuit breaker. |
-| `position_snapshot` | Currently-held-position snapshots with Alpaca's own unrealized P&L, ~1/minute — `display`'s last-trade P&L and top-movers stock chart. Not `market_data_cache` (below) — see its row. |
-| `bot_value_snapshot` | Per-bot target-weighted price index, ~1/minute — `display`'s per-bot candlestick chart. Not a segregated per-bot ledger; see `device_core/db/models.py`'s `BotValueSnapshot` docstring. |
+| `position_snapshot` | Currently-held-position snapshots with Alpaca's own unrealized P&L, ~1/minute — `display`'s last-trade P&L. No longer feeds a stock chart; see `market_data_cache` below. |
+| `bot_value_snapshot` | Per-bot target-weighted price index, ~1/minute. No longer rendered as a chart — `display`'s per-bot idle screen dropped its candlestick in favor of showing the bot's full target-weights breakdown and recent trade activity instead; see `device_core/db/models.py`'s `BotValueSnapshot` docstring. |
 | `bot_state` | Cross-run state a stateful bot (e.g. draco's circuit breaker) needs carried between `trading_worker` cycles. |
 | `manual_holding` | Individually-held, locked-quantity stocks added via `portfolio_web` (4.5) — `trading_worker` buys up to `target_qty`, never sells, and every bot's rebalance math excludes these symbols entirely. |
-| `market_data_cache` | **Not implemented.** Originally scoped as cached OHLCV bars; `position_snapshot`'s own current-price history covers the one feature that would have needed it (the stock candlestick view) without a second market-data subsystem — see `device_core/db/models.py`'s module docstring. |
+| `market_data_cache` | Cached OHLC bars per (symbol, slide ∈ {1h, 1d, 1y}), refreshed by `trading_worker/stock_bar_sync.py` from Alpaca's market-data API on its own slower cadence. Originally scoped here and deferred at migration 0004 in favor of reusing `position_snapshot`; implemented at migration 0009 once the owner asked for a real per-stock 1-hour/1-trading-day/1-year chart, which current-price-only samples can't produce. Powers `display`'s per-stock idle screen (top 3 symbols by position size + top 2 by prior-day movement, 3 slides each). |
 | `software_release` | Installed/staged release versions and their status (staged/active/rolled_back), used by the updater. |
 | `device_event` | Append-only local event log (`trade_executed`, `awaiting_activation`, `connectivity_changed`, `update_available`, ...) — the pub/sub channel `display` tails. |
 

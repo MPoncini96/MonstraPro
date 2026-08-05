@@ -470,6 +470,19 @@ NOT YET WORKING / NOT YET TESTED
     (nothing has tried to use them for real) but both are still needed
     before Wi-Fi onboarding and software updates will fully work
     unattended.
+  - TODO: automatic updates. Right now every update is manual (SSH in,
+    git pull, sudo image/scripts/install.sh, restart the changed
+    services) - see this session's "how to update the box" notes above.
+    services/updater already has the real pieces (Ed25519 signature
+    verification, atomic extract/symlink-swap, health-check-then-rollback)
+    but only ever talks to NullManifestClient, an honest stub that always
+    reports "nothing to update" - there's no actual pipeline that builds a
+    signed release from this repo, publishes a manifest with a real
+    artifactUrl, and lets a real HTTPManifestClient pull it. Needs: a
+    signing key, a release-build step, somewhere to host the artifact, and
+    the real HTTPManifestClient itself. The systemctl-restart polkit rule
+    noted above is also a prerequisite (updater's release-apply flow needs
+    it to restart the other services after swapping in a new release).
 
 
 HOW TO RESUME

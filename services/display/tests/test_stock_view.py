@@ -1,46 +1,62 @@
-from display.stock_view import build_stock_view, top_movers
+from display.stock_view import SLIDE_LABELS, SLIDES, build_stock_view, selected_symbols
+
+_BARS = [
+    {"ts": "2026-08-04T09:00:00+00:00", "open": 100.0, "high": 105.0, "low": 99.0, "close": 102.0},
+    {"ts": "2026-08-04T10:00:00+00:00", "open": 102.0, "high": 108.0, "low": 101.0, "close": 106.0},
+]
 
 
-def _record_position(core, symbol, *, current_price=100.0, unrealized_plpc=0.0, unrealized_intraday_plpc=0.0):
-    core.positions.record(
-        symbol=symbol, qty=10.0, avg_entry_price=100.0, current_price=current_price,
-        market_value=current_price * 10, unrealized_pl=(current_price - 100.0) * 10,
-        unrealized_plpc=unrealized_plpc, unrealized_intraday_plpc=unrealized_intraday_plpc,
-    )
+def test_selected_symbols_reflects_the_market_data_cache(core):
+    assert selected_symbols(core) == []
+
+    core.market_data.save(symbol="AAPL", slide="1h", bars=_BARS)
+    core.market_data.save(symbol="MSFT", slide="1h", bars=_BARS)
+
+    assert selected_symbols(core) == ["AAPL", "MSFT"]
 
 
-class TestTopMovers:
-    def test_no_positions_returns_empty_list(self, core):
-        assert top_movers(core) == []
+def test_build_stock_view_for_uncached_symbol_has_no_candles_or_change(core):
+    view = build_stock_view(core, "AAPL", "1h")
 
-    def test_ranks_by_absolute_intraday_move_descending(self, core):
-        _record_position(core, "AAPL", unrealized_intraday_plpc=0.01)
-        _record_position(core, "TSLA", unrealized_intraday_plpc=-0.08)
-        _record_position(core, "MSFT", unrealized_intraday_plpc=0.03)
-
-        assert top_movers(core) == ["TSLA", "MSFT", "AAPL"]
-
-    def test_limited_to_requested_count(self, core):
-        for i, symbol in enumerate(["AAPL", "TSLA", "MSFT", "NVDA"]):
-            _record_position(core, symbol, unrealized_intraday_plpc=0.01 * (i + 1))
-
-        assert len(top_movers(core, limit=3)) == 3
+    assert view.symbol == "AAPL"
+    assert view.slide == "1h"
+    assert view.slide_label == "Last hour"
+    assert view.candles == []
+    assert view.pct_change is None
+    assert view.fetched_at is None
 
 
-class TestBuildStockView:
-    def test_unknown_symbol_has_no_pl_and_no_candles(self, core):
-        view = build_stock_view(core, "AAPL")
+def test_build_stock_view_converts_cached_bars_to_candles(core):
+    core.market_data.save(symbol="AAPL", slide="1h", bars=_BARS)
 
-        assert view.symbol == "AAPL"
-        assert view.unrealized_plpc is None
-        assert view.candles == []
+    view = build_stock_view(core, "AAPL", "1h")
 
-    def test_includes_unrealized_plpc_and_price_candles(self, core):
-        _record_position(core, "AAPL", current_price=150.0, unrealized_plpc=0.05)
-        _record_position(core, "AAPL", current_price=155.0, unrealized_plpc=0.083)
+    assert len(view.candles) == 2
+    assert view.candles[0].open == 100.0
+    assert view.candles[-1].close == 106.0
+    assert view.fetched_at is not None
 
-        view = build_stock_view(core, "AAPL")
 
-        assert view.unrealized_plpc == 0.083
-        assert len(view.candles) >= 1
-        assert view.candles[-1].close == 155.0
+def test_build_stock_view_computes_pct_change_from_first_open_to_last_close(core):
+    core.market_data.save(symbol="AAPL", slide="1h", bars=_BARS)
+
+    view = build_stock_view(core, "AAPL", "1h")
+
+    assert view.pct_change == (106.0 - 100.0) / 100.0
+
+
+def test_each_slide_has_a_distinct_label():
+    assert SLIDE_LABELS.keys() == set(SLIDES)
+    assert len(set(SLIDE_LABELS.values())) == len(SLIDES)
+
+
+def test_build_stock_view_reads_the_requested_slide_independently(core):
+    core.market_data.save(symbol="AAPL", slide="1h", bars=_BARS)
+    core.market_data.save(symbol="AAPL", slide="1y", bars=[])
+
+    hour_view = build_stock_view(core, "AAPL", "1h")
+    year_view = build_stock_view(core, "AAPL", "1y")
+
+    assert len(hour_view.candles) == 2
+    assert year_view.candles == []
+    assert year_view.slide_label == "Last year"

@@ -7,6 +7,7 @@ from device_core.repositories.device import Device, DeviceRepository
 from device_core.repositories.device_event import DeviceEventRepository
 from device_core.repositories.execution_log import ExecutionLogRepository
 from device_core.repositories.manual_holding import ManualHoldingRepository
+from device_core.repositories.market_data_cache import MarketDataCacheRepository
 from device_core.repositories.orders import OrderRepository
 from device_core.repositories.position_snapshot import PositionSnapshotRepository
 from device_core.repositories.signals import SignalRepository
@@ -28,5 +29,6 @@ __all__ = [
     "PositionSnapshotRepository",
     "BotValueSnapshotRepository",
     "ManualHoldingRepository",
+    "MarketDataCacheRepository",
     "SoftwareReleaseRepository",
 ]

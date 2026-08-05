@@ -32,6 +32,7 @@ from device_core.repositories import (
     DeviceRepository,
     ExecutionLogRepository,
     ManualHoldingRepository,
+    MarketDataCacheRepository,
     OrderRepository,
     PortfolioAllocationRepository,
     PositionSnapshotRepository,
@@ -60,6 +61,7 @@ class DeviceCore:
     bot_values: BotValueSnapshotRepository
     manual_holdings: ManualHoldingRepository
     software_releases: SoftwareReleaseRepository
+    market_data: MarketDataCacheRepository
     vault: Vault
 
     @classmethod
@@ -86,6 +88,7 @@ class DeviceCore:
             bot_values=BotValueSnapshotRepository(database),
             manual_holdings=ManualHoldingRepository(database),
             software_releases=SoftwareReleaseRepository(database),
+            market_data=MarketDataCacheRepository(database),
             vault=vault,
         )
 

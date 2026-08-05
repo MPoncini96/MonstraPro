@@ -13,8 +13,12 @@ account, so there's nothing to serialize against).
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockBarsRequest
+from alpaca.data.timeframe import TimeFrame
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.trading.requests import MarketOrderRequest
@@ -24,6 +28,21 @@ from alpaca.trading.requests import MarketOrderRequest
 class AccountSnapshot:
     equity: float
     cash: float
+
+
+@dataclass(frozen=True)
+class Bar:
+    """One OHLC bar from Alpaca's market-data API - feeds
+    trading_worker/stock_bar_sync.py's per-symbol 1h/1d/1y chart cache
+    (device_core.MarketDataCache), a different data source from
+    list_position_values()/list_positions() (Alpaca's trading API, this
+    account's own current holdings, not historical price bars)."""
+
+    ts: datetime
+    open: float
+    high: float
+    low: float
+    close: float
 
 
 @dataclass(frozen=True)
@@ -63,6 +82,9 @@ class AlpacaClient:
         # every caller.
         paper = "paper" in base_url
         self._client = TradingClient(api_key, api_secret, paper=paper)
+        # Market-data API is environment-agnostic (no paper/live split - real
+        # historical bars either way), unlike TradingClient above.
+        self._data_client = StockHistoricalDataClient(api_key, api_secret)
 
     def get_account(self) -> AccountSnapshot:
         account = self._client.get_account()
@@ -112,3 +134,19 @@ class AlpacaClient:
             status=str(order.status.value if hasattr(order.status, "value") else order.status),
             raw=order.model_dump(mode="json"),
         )
+
+    def get_bars(
+        self, symbol: str, *, timeframe: TimeFrame, start: datetime, end: datetime, limit: int | None = None
+    ) -> list[Bar]:
+        """Historical OHLC bars for `symbol` between [start, end] at the
+        given granularity. Caller (stock_bar_sync.py) decides what
+        timeframe/window means "last hour" vs "last trading day" vs "last
+        year" - this method is a thin, generic wrapper, same philosophy as
+        the rest of this class."""
+        request = StockBarsRequest(symbol_or_symbols=symbol, timeframe=timeframe, start=start, end=end, limit=limit)
+        bar_set = self._data_client.get_stock_bars(request)
+        raw_bars = bar_set.data.get(symbol, [])
+        return [
+            Bar(ts=bar.timestamp, open=float(bar.open), high=float(bar.high), low=float(bar.low), close=float(bar.close))
+            for bar in raw_bars
+        ]

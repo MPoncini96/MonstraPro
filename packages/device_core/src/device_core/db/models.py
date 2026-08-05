@@ -8,12 +8,10 @@ Phase 2 (migration 0002, trading_worker): order, bot_state, account_snapshot.
 Phase 3 (migration 0003, updater): software_release.
 
 Phase 4 (migration 0004, display's idle-screen rotation): position_snapshot,
-bot_value_snapshot. `market_data_cache` (ARCHITECTURE.md section 7) is
-still not added - the stock-candlestick view that would have needed real
-exchange OHLC bars instead reuses position_snapshot's own current_price
-history (the same ~60s local sampling account_snapshot already uses),
-avoiding a second market-data subsystem for what's a passive status
-display, not a trading terminal.
+bot_value_snapshot. `market_data_cache` (ARCHITECTURE.md section 7) was
+deferred at this point in favor of reusing position_snapshot's own
+current_price history for the stock view - see Phase 7 below for why that
+stopped being enough and market_data_cache was added after all.
 
 Phase 5 (migration 0005, local portfolio editing): `device.local_pin`
 column, `manual_holding` table. Both exist for services/portfolio_web, a
@@ -29,6 +27,14 @@ against monstra.pro's already-built `/api/devices/register` +
 `/api/devices/pair` + `/api/devices/status` - see
 device_core.repositories.device.DeviceRepository.store_registration's
 docstring for the full protocol.
+
+Phase 7 (migration 0009, market_data_cache): implements the table
+ARCHITECTURE.md section 7 originally scoped and Phase 4 above deferred.
+position_snapshot's current_price-only history can't support real
+historical charting (no OHLC, no reach back further than this device has
+been running) - the owner asked for a proper 1-hour/1-trading-day/1-year
+view per stock, which needs real Alpaca market-data bars. See
+trading_worker/stock_bar_sync.py for what fetches and populates this.
 
 Schema is created/evolved exclusively through Alembic migrations
 (db/migrations/versions/) - this module defines the mapped classes that
@@ -354,3 +360,28 @@ class DeviceEvent(Base):
     payload_json: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     consumed_by: Mapped[str | None] = mapped_column(String(64))
+
+
+class MarketDataCache(Base):
+    """Cached OHLC bars from Alpaca's market-data API, one row per
+    (symbol, slide) - "slide" is one of "1h"/"1d"/"1y", matching display's
+    three-slide per-stock view (last hour / last trading day / last year).
+    Refreshed by trading_worker.stock_bar_sync on its own slower cadence,
+    independent of the trading cycle. Unlike the other snapshot tables in
+    this file, this is NOT append-only history: each sync overwrites the
+    previous bars for that (symbol, slide) pair, since display only ever
+    needs the freshest known chart, never a trail of past fetches.
+
+    See this module's own docstring (Phase 7) for why this exists now
+    after being deferred at Phase 4 - position_snapshot's current-price-only
+    samples can't produce a real OHLC chart or reach back a year.
+    """
+
+    __tablename__ = "market_data_cache"
+    __table_args__ = (UniqueConstraint("symbol", "slide", name="uq_market_data_cache_symbol_slide"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    symbol: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    slide: Mapped[str] = mapped_column(String(8), nullable=False)
+    bars_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False)
+    fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)

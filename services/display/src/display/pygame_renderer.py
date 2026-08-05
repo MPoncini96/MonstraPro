@@ -36,7 +36,7 @@ pass - still flagged in image/README.md "What remains".
 from __future__ import annotations
 
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pygame
 
@@ -50,6 +50,7 @@ from display.stock_view import StockView
 DEFAULT_SIZE = (800, 480)
 _BANNER_HEIGHT = 36
 _CHART_HEIGHT = 70
+_FOOTER_RESERVE = 28
 
 _BG = (12, 14, 20)
 _FG = (230, 232, 238)
@@ -139,7 +140,11 @@ class PygameRenderer:
 
     def render_idle_bot(self, view: BotView, banner: str | None, *, local_pin: str | None = None) -> None:
         """idle_rotation.IdlePhase.BOT - one active bot at a time, rotating
-        (see display.idle_rotation / display.main._render_idle)."""
+        (see display.idle_rotation / display.main._render_idle). No chart -
+        only the portfolio screen keeps a candlestick; this shows every
+        stock the bot currently signals plus the device's overall recent
+        trade activity (not this bot's alone - see BotView's docstring on
+        why per-bot attribution isn't available)."""
         screen = self._require_screen()
         screen.fill(_BG)
         y = 20 + _BANNER_HEIGHT
@@ -154,18 +159,25 @@ class PygameRenderer:
         screen.blit(signal_text, (20, y))
         y += 40
 
-        # "Value (approx.)" not "Performance" - deliberately distinct label
-        # from render_idle's account-level chart, since this is a
-        # target-weighted price index, not a dollar amount actually
-        # invested - see device_core.db.models.BotValueSnapshot's docstring.
-        self._draw_candles(screen, y, view.candles, label="Value (approx.)")
+        # Split whatever's left between the two sections so neither one
+        # (e.g. a bot signaling on 8+ symbols) starves the other out - see
+        # image/README.md "What remains" for this panel's general
+        # layout-tightness constraint at the real 480x320 resolution.
+        footer_y = self._size[1] - _FOOTER_RESERVE
+        midpoint = y + (footer_y - y) // 2
+        y = self._draw_target_weights(screen, y, view.target_weights, max_y=midpoint)
+        y += 10
+        self._draw_recent_orders(screen, y, view.recent_orders, label="Recent activity (device-wide)", max_y=footer_y)
         self._draw_local_access_footer(screen, local_pin)
         self._draw_banner(screen, banner)
         self._present()
 
     def render_idle_stock(self, view: StockView, banner: str | None, *, local_pin: str | None = None) -> None:
-        """idle_rotation.IdlePhase.STOCK - one top-mover symbol at a time,
-        rotating (see display.idle_rotation / display.main._render_idle)."""
+        """idle_rotation.IdlePhase.STOCK - one (symbol, slide) combination at
+        a time, rotating through the 5 tracked symbols x 3 slides (see
+        display.idle_rotation / display.main._render_idle). view.slide_label
+        ("Last hour"/"Last trading day"/"Last year") is the explicit timing
+        reference the chart itself doesn't otherwise carry."""
         screen = self._require_screen()
         screen.fill(_BG)
         y = 20 + _BANNER_HEIGHT
@@ -174,16 +186,18 @@ class PygameRenderer:
         screen.blit(symbol_text, (20, y))
         y += 50
 
-        if view.unrealized_plpc is not None:
-            pct = view.unrealized_plpc * 100
+        if view.pct_change is not None:
+            pct = view.pct_change * 100
             color = _GREEN if pct >= 0 else _RED
-            move_text = self._font_medium.render(f"{'+' if pct >= 0 else ''}{pct:.2f}% today", True, color)
+            move_text = self._font_medium.render(
+                f"{'+' if pct >= 0 else ''}{pct:.2f}% ({view.slide_label.lower()})", True, color
+            )
         else:
-            move_text = self._font_medium.render("no position data yet", True, _MUTED)
+            move_text = self._font_medium.render("no chart data yet", True, _MUTED)
         screen.blit(move_text, (20, y))
         y += 40
 
-        self._draw_candles(screen, y, view.candles, label="Price")
+        self._draw_candles(screen, y, view.candles, label=f"Price — {view.slide_label}")
         self._draw_local_access_footer(screen, local_pin)
         self._draw_banner(screen, banner)
         self._present()
@@ -251,15 +265,9 @@ class PygameRenderer:
         y = self._draw_header(screen, y, snapshot)
         y += 20
 
-        label = self._font_medium.render("Recent activity", True, _FG)
-        screen.blit(label, (20, y))
-        y += 34
-        for order in snapshot.recent_orders[:8]:
-            color = _GREEN if order["side"] == "buy" else _RED
-            line = f"{order['side'].upper():4s} {order['symbol']:6s} ${order['notional'] or 0:,.2f}  [{order['status']}]"
-            text = self._font_small.render(line, True, color)
-            screen.blit(text, (30, y))
-            y += 24
+        self._draw_recent_orders(
+            screen, y, snapshot.recent_orders, label="Recent activity", max_y=self._size[1] - _FOOTER_RESERVE
+        )
 
         self._draw_banner(screen, banner)
         self._present()
@@ -295,6 +303,77 @@ class PygameRenderer:
 
         return y + 70
 
+    def _draw_target_weights(self, screen: pygame.Surface, y: int, target_weights: dict, *, max_y: int) -> int:
+        """Every stock a bot currently signals (its full target-weights
+        breakdown), largest allocation first - used only by render_idle_bot,
+        which has no chart of its own (see BotView's docstring). Stops
+        drawing at `max_y` (leaving room for whatever comes after, e.g.
+        recent orders + the footer) rather than silently running off the
+        bottom of the real 480x320 panel - shows a "+N more" line instead of
+        just cutting off invisibly."""
+        label = self._font_medium.render("Signals", True, _FG)
+        screen.blit(label, (20, y))
+        y += 26
+
+        if not target_weights:
+            text = self._font_small.render("no active allocation yet", True, _MUTED)
+            screen.blit(text, (30, y))
+            return y + 20
+
+        items = sorted(target_weights.items(), key=lambda item: item[1], reverse=True)
+        line_height = 18
+        shown = 0
+        for symbol, weight in items:
+            if y + line_height > max_y:
+                break
+            line = f"{symbol:6s} {weight * 100:5.1f}%"
+            text = self._font_small.render(line, True, _FG)
+            screen.blit(text, (30, y))
+            y += line_height
+            shown += 1
+
+        if shown < len(items) and y + line_height <= max_y:
+            more = self._font_small.render(f"+{len(items) - shown} more", True, _MUTED)
+            screen.blit(more, (30, y))
+            y += line_height
+
+        return y
+
+    def _draw_recent_orders(self, screen: pygame.Surface, y: int, orders: list, *, label: str, max_y: int) -> int:
+        """Shared by render_trade_wake and render_idle_bot - the device's
+        most recent trades (already limited to 8 by the caller's query;
+        this only ever takes the first 8 of whatever it's given as a second
+        safety net). Stops at `max_y` for the same reason
+        _draw_target_weights does."""
+        label_surface = self._font_medium.render(label, True, _FG)
+        screen.blit(label_surface, (20, y))
+        y += 26
+
+        if not orders:
+            text = self._font_small.render("no trades yet", True, _MUTED)
+            screen.blit(text, (30, y))
+            return y + 20
+
+        capped = orders[:8]
+        line_height = 18
+        shown = 0
+        for order in capped:
+            if y + line_height > max_y:
+                break
+            color = _GREEN if order["side"] == "buy" else _RED
+            line = f"{order['side'].upper():4s} {order['symbol']:6s} ${order['notional'] or 0:,.2f}  [{order['status']}]"
+            text = self._font_small.render(line, True, color)
+            screen.blit(text, (30, y))
+            y += line_height
+            shown += 1
+
+        if shown < len(capped) and y + line_height <= max_y:
+            more = self._font_small.render(f"+{len(capped) - shown} more", True, _MUTED)
+            screen.blit(more, (30, y))
+            y += line_height
+
+        return y
+
     def _draw_last_trade(self, screen: pygame.Surface, y: int, last_trade: LastTradeInfo | None) -> int:
         if last_trade is None:
             text = self._font_small.render("no trades yet", True, _MUTED)
@@ -313,15 +392,32 @@ class PygameRenderer:
         screen.blit(text, (20, y))
         return y + 24
 
+    @staticmethod
+    def _format_span(span: timedelta) -> str:
+        """A human-readable "how much history is this" caption - the actual
+        gap this addresses: candles alone don't say whether they're 5
+        minutes or 5 months apart."""
+        total_seconds = span.total_seconds()
+        if total_seconds < 3600:
+            return f"{max(1, int(total_seconds // 60))}m"
+        if total_seconds < 86400:
+            return f"{total_seconds / 3600:.1f}h"
+        days = total_seconds / 86400
+        if days < 60:
+            return f"{days:.0f}d"
+        return f"{days / 30:.0f}mo"
+
     def _draw_candles(self, screen: pygame.Surface, y: int, candles: list[Candle], *, label: str) -> int:
-        """Renders any (ts, value) series already bucketed into candles by
-        display.candles.build_candles - see that module for the
-        OHLC-bucketing rationale (why buckets are coarser than the ~60s
-        data-refresh cadence). Pure drawing: no bucketing/aggregation
-        happens here, only pixel mapping. `label` distinguishes what's
-        being shown (account "Performance", a bot's approximate "Value",
-        or a stock's "Price") since idle_rotation cycles this same drawing
-        routine across three different data sources."""
+        """Renders any (ts, value) series already bucketed/fetched into
+        candles by display.candles.build_candles or display.stock_view - see
+        those modules for how each candle's timespan is decided. Pure
+        drawing: no bucketing/aggregation happens here, only pixel mapping.
+        `label` distinguishes what's being shown (account "Performance", a
+        stock's "Price — Last hour") since idle_rotation cycles this same
+        drawing routine across multiple data sources. Always captions the
+        total visible time span underneath - the actual reference point the
+        chart itself doesn't otherwise carry (owner feedback: "no reference
+        to what they represent timing wise")."""
         label_surface = self._font_medium.render(label, True, _FG)
         screen.blit(label_surface, (20, y))
         y += 30
@@ -358,7 +454,12 @@ class PygameRenderer:
                 bottom = top + 1  # a doji (open == close) still needs a visible mark
             pygame.draw.rect(screen, color, pygame.Rect(cx - body_width // 2, top, body_width, bottom - top))
 
-        return y + _CHART_HEIGHT
+        span = candles[-1].bucket_start - candles[0].bucket_start
+        caption = f"{len(candles)} candles, last {self._format_span(span)}" if span.total_seconds() > 0 else f"{len(candles)} candles"
+        caption_surface = self._font_small.render(caption, True, _MUTED)
+        screen.blit(caption_surface, (chart_left, y + _CHART_HEIGHT + 2))
+
+        return y + _CHART_HEIGHT + 20
 
     def _draw_local_access_footer(self, screen: pygame.Surface, local_pin: str | None) -> None:
         """A persistent, small reminder of how to reach
