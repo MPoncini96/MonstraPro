@@ -66,6 +66,8 @@ class TestBuildSnapshot:
         assert snapshot.last_sync_at is None
         assert snapshot.bots == []
         assert snapshot.recent_orders == []
+        assert snapshot.largest_positions == []
+        assert snapshot.biggest_movers == []
 
     def test_includes_active_bots_signals_and_orders(self, core):
         core.strategies.upsert(bot_slug="force", display_name="Force")
@@ -103,6 +105,49 @@ class TestBuildSnapshot:
         # equity value is the last candle's close.
         assert len(snapshot.candles) >= 1
         assert snapshot.candles[-1].close == 10250.75
+
+    def test_largest_positions_are_the_two_biggest_by_weight(self, core):
+        core.account_snapshots.record(equity=1000.0, cash=0.0)
+        core.positions.record(
+            symbol="NVDA", qty=1, avg_entry_price=180.0, current_price=180.0, market_value=180.0,
+            unrealized_pl=0.0, unrealized_plpc=0.0, unrealized_intraday_plpc=0.01,
+        )
+        core.positions.record(
+            symbol="PLTR", qty=1, avg_entry_price=130.0, current_price=130.0, market_value=130.0,
+            unrealized_pl=0.0, unrealized_plpc=0.0, unrealized_intraday_plpc=-0.02,
+        )
+        core.positions.record(
+            symbol="AAPL", qty=1, avg_entry_price=50.0, current_price=50.0, market_value=50.0,
+            unrealized_pl=0.0, unrealized_plpc=0.0, unrealized_intraday_plpc=0.005,
+        )
+
+        snapshot = build_snapshot(core)
+
+        assert [p.symbol for p in snapshot.largest_positions] == ["NVDA", "PLTR"]
+        assert snapshot.largest_positions[0].weight == 0.18
+
+    def test_biggest_movers_are_the_three_largest_absolute_pct_moves(self, core):
+        core.account_snapshots.record(equity=1000.0, cash=0.0)
+        core.positions.record(
+            symbol="NVDA", qty=1, avg_entry_price=180.0, current_price=180.0, market_value=180.0,
+            unrealized_pl=0.0, unrealized_plpc=0.0, unrealized_intraday_plpc=0.048,
+        )
+        core.positions.record(
+            symbol="META", qty=1, avg_entry_price=130.0, current_price=130.0, market_value=130.0,
+            unrealized_pl=0.0, unrealized_plpc=0.0, unrealized_intraday_plpc=0.032,
+        )
+        core.positions.record(
+            symbol="TSLA", qty=1, avg_entry_price=50.0, current_price=50.0, market_value=50.0,
+            unrealized_pl=0.0, unrealized_plpc=0.0, unrealized_intraday_plpc=-0.021,
+        )
+        core.positions.record(
+            symbol="AAPL", qty=1, avg_entry_price=50.0, current_price=50.0, market_value=50.0,
+            unrealized_pl=0.0, unrealized_plpc=0.0, unrealized_intraday_plpc=0.001,
+        )
+
+        snapshot = build_snapshot(core)
+
+        assert [p.symbol for p in snapshot.biggest_movers] == ["NVDA", "META", "TSLA"]
 
     def test_pl_today_and_last_sync_at_use_real_db_timestamps(self, core):
         # Regression test: AccountSnapshotRepository returns naive

@@ -49,6 +49,13 @@ class BotPerformance:
 
 
 @dataclass(frozen=True)
+class PositionSummary:
+    symbol: str
+    weight: float  # fraction of portfolio equity, e.g. 0.18
+    pct_change_today: float | None  # PositionSnapshot.unrealized_intraday_plpc
+
+
+@dataclass(frozen=True)
 class DisplaySnapshot:
     portfolio_equity: float | None
     portfolio_pl_today: float | None
@@ -57,6 +64,8 @@ class DisplaySnapshot:
     bots: list[BotPerformance] = field(default_factory=list)
     recent_orders: list[dict[str, Any]] = field(default_factory=list)
     candles: list[Candle] = field(default_factory=list)
+    largest_positions: list[PositionSummary] = field(default_factory=list)
+    biggest_movers: list[PositionSummary] = field(default_factory=list)
 
 
 def is_market_open_heuristic(*, now: datetime | None = None) -> bool:
@@ -79,6 +88,15 @@ def _today_pl(snapshots_newest_first: list[dict[str, Any]], *, today: date) -> f
     return float(latest["equity"]) - float(earliest_today["equity"])
 
 
+def _largest_positions(summaries: list[PositionSummary], *, limit: int) -> list[PositionSummary]:
+    return sorted(summaries, key=lambda p: p.weight, reverse=True)[:limit]
+
+
+def _biggest_movers(summaries: list[PositionSummary], *, limit: int) -> list[PositionSummary]:
+    with_change = [p for p in summaries if p.pct_change_today is not None]
+    return sorted(with_change, key=lambda p: abs(p.pct_change_today), reverse=True)[:limit]
+
+
 def build_snapshot(core: DeviceCore, *, now: datetime | None = None) -> DisplaySnapshot:
     now = now or datetime.now(timezone.utc)
 
@@ -87,6 +105,19 @@ def build_snapshot(core: DeviceCore, *, now: datetime | None = None) -> DisplayS
     portfolio_pl_today = _today_pl(snapshots, today=now.astimezone(timezone.utc).date())
     last_sync_at = as_utc(snapshots[0]["ts"]) if snapshots else None
     candles = build_candles(snapshots)
+
+    position_summaries = (
+        [
+            PositionSummary(
+                symbol=symbol,
+                weight=float(row["market_value"]) / portfolio_equity,
+                pct_change_today=row.get("unrealized_intraday_plpc"),
+            )
+            for symbol, row in core.positions.latest_by_symbol().items()
+        ]
+        if portfolio_equity
+        else []
+    )
 
     bots: list[BotPerformance] = []
     all_orders: list[dict[str, Any]] = []
@@ -117,4 +148,6 @@ def build_snapshot(core: DeviceCore, *, now: datetime | None = None) -> DisplayS
         bots=bots,
         recent_orders=recent_orders,
         candles=candles,
+        largest_positions=_largest_positions(position_summaries, limit=2),
+        biggest_movers=_biggest_movers(position_summaries, limit=3),
     )

@@ -24,6 +24,37 @@ def test_build_stock_view_for_uncached_symbol_has_no_candles_or_change(core):
     assert view.candles == []
     assert view.pct_change is None
     assert view.fetched_at is None
+    assert view.portfolio_weight is None
+    assert view.owned_by == []
+
+
+def test_portfolio_weight_is_market_value_over_account_equity(core):
+    core.account_snapshots.record(equity=1000.0, cash=0.0)
+    core.positions.record(
+        symbol="AAPL",
+        qty=1,
+        avg_entry_price=180.0,
+        current_price=180.0,
+        market_value=180.0,
+        unrealized_pl=0.0,
+        unrealized_plpc=0.0,
+        unrealized_intraday_plpc=0.0,
+    )
+
+    view = build_stock_view(core, "AAPL", "1h")
+
+    assert view.portfolio_weight == 0.18
+
+
+def test_owned_by_lists_active_bots_currently_targeting_the_symbol(core):
+    core.strategies.upsert(bot_slug="force", display_name="Force")
+    core.allocations.replace(bot_slug="force", target_weights={"AAPL": 1.0}, current_weights={})
+    core.strategies.upsert(bot_slug="aptet", display_name="Aptet")
+    core.allocations.replace(bot_slug="aptet", target_weights={"MSFT": 1.0}, current_weights={})
+
+    view = build_stock_view(core, "AAPL", "1h")
+
+    assert view.owned_by == ["Force"]
 
 
 def test_build_stock_view_converts_cached_bars_to_candles(core):
