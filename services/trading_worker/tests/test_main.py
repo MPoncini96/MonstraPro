@@ -1,6 +1,14 @@
+from datetime import date, datetime
+
 import trading_worker.main as main_module
 from trading_worker.activation import ActivationStatus
-from trading_worker.main import _record_snapshots, _wait_for_activation
+from trading_worker.main import (
+    MARKET_TIMEZONE,
+    _latest_due_cycle_time,
+    _record_snapshots,
+    _wait_for_activation,
+    scheduled_cycle_times_et,
+)
 
 
 class FakeAlpacaAccount:
@@ -289,6 +297,24 @@ def test_run_trading_loop_syncs_bot_selections_every_tick(core, monkeypatch):
     assert len(sync_calls) == 2  # once per still-activated tick
 
 
+def test_run_trading_loop_calls_stock_bar_sync(core, monkeypatch):
+    activation = _ScriptedActivationClient(
+        [ActivationStatus(activated=True, device_serial="MPB-TEST"), ActivationStatus(activated=False, device_serial="MPB-TEST")]
+    )
+    monkeypatch.setattr(main_module.time, "sleep", lambda _: None)
+    monkeypatch.setattr(main_module, "_build_alpaca_client", lambda core: object())
+    monkeypatch.setattr(main_module, "_record_snapshots", lambda core, alpaca: None)
+    monkeypatch.setattr(main_module.market_data_provider, "is_market_open", lambda: False)
+    monkeypatch.setattr(main_module, "check_run_requested", lambda core: False)
+    monkeypatch.setattr(main_module, "sync_bot_selections", lambda core: None)
+    sync_calls = []
+    monkeypatch.setattr(main_module, "sync_stock_bars", lambda core, alpaca: sync_calls.append(True))
+
+    main_module._run_trading_loop(core, activation)
+
+    assert sync_calls == [True]
+
+
 def test_run_trading_loop_survives_bot_selection_sync_raising(core, monkeypatch):
     """A bug in the sync call (or a raised exception it doesn't itself
     catch) must not take down the whole trading loop."""
@@ -334,3 +360,99 @@ def test_run_trading_loop_discards_run_request_when_market_closed(core, monkeypa
     main_module._run_trading_loop(core, activation)
 
     assert acked == [True]  # discarded, not left pending until the market reopens
+
+
+# --- Hourly trading-cycle schedule ------------------------------------------
+
+
+def test_scheduled_cycle_times_are_hourly_at_five_past_except_the_last(core):
+    """Owner-requested behavior: once an hour, 5 minutes after the hour,
+    except the final hour before close, which runs 20 minutes before close
+    instead so the last cycle of the day has room to actually finish."""
+    schedule = scheduled_cycle_times_et(date(2026, 8, 4))  # a plain trading day
+
+    assert [t.strftime("%H:%M") for t in schedule] == [
+        "10:05", "11:05", "12:05", "13:05", "14:05", "15:40",
+    ]
+    assert all(t.tzinfo is not None for t in schedule)
+
+
+def test_latest_due_cycle_time_picks_the_most_recently_passed_slot():
+    schedule = scheduled_cycle_times_et(date(2026, 8, 4))
+
+    before_open = datetime(2026, 8, 4, 9, 45, tzinfo=MARKET_TIMEZONE)
+    assert _latest_due_cycle_time(before_open, schedule) is None
+
+    mid_slot = datetime(2026, 8, 4, 11, 30, tzinfo=MARKET_TIMEZONE)
+    assert _latest_due_cycle_time(mid_slot, schedule) == schedule[1]  # 11:05, not 12:05 yet
+
+    right_at_close = datetime(2026, 8, 4, 15, 59, tzinfo=MARKET_TIMEZONE)
+    assert _latest_due_cycle_time(right_at_close, schedule) == schedule[-1]  # 15:40
+
+
+class _FixedDatetime(datetime):
+    """Subclasses the real datetime so datetime.combine/arithmetic inside
+    scheduled_cycle_times_et still works normally - only .now() is
+    overridden, letting a test pin main.py's wall-clock read without
+    touching the real system clock."""
+
+    _fixed_now: datetime
+
+    @classmethod
+    def now(cls, tz=None):
+        return cls._fixed_now
+
+
+def _patch_now(monkeypatch, fixed_now: datetime):
+    fixed = type("_Fixed", (_FixedDatetime,), {"_fixed_now": fixed_now})
+    monkeypatch.setattr(main_module, "datetime", fixed)
+
+
+def test_run_trading_loop_does_not_fire_before_the_first_scheduled_slot(core, monkeypatch):
+    from trading_worker.activation import ActivationStatus as _Status
+
+    activation = _ScriptedActivationClient(
+        [_Status(activated=True, device_serial="MPB-TEST"), _Status(activated=False, device_serial="MPB-TEST")]
+    )
+    monkeypatch.setattr(main_module.time, "sleep", lambda _: None)
+    monkeypatch.setattr(main_module, "_build_alpaca_client", lambda core: object())
+    monkeypatch.setattr(main_module, "_record_snapshots", lambda core, alpaca: None)
+    monkeypatch.setattr(main_module, "sync_bot_selections", lambda core: None)
+    monkeypatch.setattr(main_module.market_data_provider, "is_market_open", lambda: True)
+    monkeypatch.setattr(main_module, "check_run_requested", lambda core: False)
+    ran = []
+    monkeypatch.setattr(main_module, "reconcile_manual_holdings", lambda core, alpaca: ran.append("reconcile"))
+    monkeypatch.setattr(main_module, "run_cycle", lambda core, alpaca: ran.append("cycle"))
+    _patch_now(monkeypatch, datetime(2026, 8, 4, 9, 45, tzinfo=MARKET_TIMEZONE))  # before 10:05
+
+    main_module._run_trading_loop(core, activation)
+
+    assert ran == []
+
+
+def test_run_trading_loop_fires_once_at_a_scheduled_slot_then_not_again(core, monkeypatch):
+    from trading_worker.activation import ActivationStatus as _Status
+
+    activation = _ScriptedActivationClient(
+        [
+            _Status(activated=True, device_serial="MPB-TEST"),
+            _Status(activated=True, device_serial="MPB-TEST"),
+            _Status(activated=False, device_serial="MPB-TEST"),
+        ]
+    )
+    monkeypatch.setattr(main_module.time, "sleep", lambda _: None)
+    monkeypatch.setattr(main_module, "_build_alpaca_client", lambda core: object())
+    monkeypatch.setattr(main_module, "_record_snapshots", lambda core, alpaca: None)
+    monkeypatch.setattr(main_module, "sync_bot_selections", lambda core: None)
+    monkeypatch.setattr(main_module.market_data_provider, "is_market_open", lambda: True)
+    monkeypatch.setattr(main_module, "check_run_requested", lambda core: False)
+    ran = []
+    monkeypatch.setattr(main_module, "reconcile_manual_holdings", lambda core, alpaca: ran.append("reconcile"))
+    monkeypatch.setattr(main_module, "run_cycle", lambda core, alpaca: ran.append("cycle"))
+    # Both still-activated ticks land within the same 10:05 slot (10:06, 10:07) -
+    # the cycle must run on the first tick only, not the second.
+    _patch_now(monkeypatch, datetime(2026, 8, 4, 10, 6, tzinfo=MARKET_TIMEZONE))
+
+    main_module._run_trading_loop(core, activation)
+
+    assert ran == ["reconcile", "cycle"]

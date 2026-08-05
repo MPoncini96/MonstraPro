@@ -35,11 +35,12 @@ Responsibilities (see ARCHITECTURE.md section 4.1):
      number of bots selected on monstra.pro and still run zero of them.
      Creates/updates/deactivates only source="monstra.pro" rows; a
      locally-configured (source="local") bot is never touched.
-  4. Trading loop, per scheduled cycle (TRADING_CYCLE_INTERVAL_SECONDS) or
-     immediately if the owner requested an out-of-schedule run from
-     monstra.pro (NextJS_Monsta's POST /api/devices/[deviceId]/run-now,
-     polled here via run_request.check_run_requested and market-hours
-     gated on both sides):
+  4. Trading loop, per scheduled cycle (see CYCLE_SCHEDULE_MINUTE_AFTER_HOUR/
+     CYCLE_SCHEDULE_LAST_CYCLE_MINUTES_BEFORE_CLOSE below - once an hour, not
+     every ACCOUNT_SNAPSHOT_INTERVAL_SECONDS tick) or immediately if the
+     owner requested an out-of-schedule run from monstra.pro
+     (NextJS_Monsta's POST /api/devices/[deviceId]/run-now, polled here via
+     run_request.check_run_requested and market-hours gated on both sides):
        reconcile_manual_holdings (manual_holdings.py) - buy up to each
          locked individual stock's target_qty, never sell
        -> run_cycle (loop.py) - fetch market data -> run the owner's
@@ -72,7 +73,9 @@ import logging
 import os
 import platform
 import time
+from datetime import date, datetime, time as time_of_day, timedelta
 from typing import Callable
+from zoneinfo import ZoneInfo
 
 from device_core.core import DeviceCore
 from device_core.events import EventType
@@ -90,12 +93,62 @@ from trading_worker.bot_selection_sync import sync_bot_selections
 from trading_worker.loop import run_cycle
 from trading_worker.manual_holdings import reconcile_manual_holdings
 from trading_worker.run_request import ack_run_request, check_run_requested
+from trading_worker.stock_bar_sync import sync_stock_bars
 
 logger = logging.getLogger(__name__)
 
 ACTIVATION_POLL_INTERVAL_SECONDS = 60
 ACCOUNT_SNAPSHOT_INTERVAL_SECONDS = 60
-TRADING_CYCLE_INTERVAL_SECONDS = 300
+
+# display's per-stock 1h/1d/1y charts don't need up-to-the-minute freshness
+# the way trading signals do, and each sync is 5 symbols x 3 slides = 15
+# Alpaca market-data calls - a slower, independent cadence, not tied to
+# ACCOUNT_SNAPSHOT_INTERVAL_SECONDS or the trading-cycle schedule.
+STOCK_BAR_SYNC_INTERVAL_SECONDS = 15 * 60
+
+# Trading-cycle schedule: once an hour, not every tick. Matches
+# strategy_engine.market_data.provider.is_market_open()'s own fixed 9:30-16:00
+# ET session bounds (no early-close handling here either, for the same
+# reason - see that module for the yfinance-fallback path this mirrors).
+MARKET_TIMEZONE = ZoneInfo("America/New_York")
+MARKET_OPEN_TIME = time_of_day(9, 30)
+MARKET_CLOSE_TIME = time_of_day(16, 0)
+CYCLE_SCHEDULE_MINUTE_AFTER_HOUR = 5
+CYCLE_SCHEDULE_LAST_CYCLE_MINUTES_BEFORE_CLOSE = 20
+
+
+def scheduled_cycle_times_et(trading_day: date) -> list[datetime]:
+    """Today's trading-cycle schedule: once per hour, at
+    CYCLE_SCHEDULE_MINUTE_AFTER_HOUR minutes past each wall-clock hour mark
+    that falls within market hours - except the LAST such hour, which runs
+    CYCLE_SCHEDULE_LAST_CYCLE_MINUTES_BEFORE_CLOSE minutes before close
+    instead of 5 minutes after its hour mark (so the last cycle of the day
+    has time to actually finish and settle before the market closes on it).
+
+    For the standard 9:30-16:00 ET session this is
+    [10:05, 11:05, 12:05, 13:05, 14:05, 15:40].
+    """
+    market_open = datetime.combine(trading_day, MARKET_OPEN_TIME, tzinfo=MARKET_TIMEZONE)
+    market_close = datetime.combine(trading_day, MARKET_CLOSE_TIME, tzinfo=MARKET_TIMEZONE)
+
+    times: list[datetime] = []
+    hour_mark = market_open.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+    while hour_mark < market_close:
+        is_last_hour = hour_mark + timedelta(hours=1) >= market_close
+        candidate = (
+            market_close - timedelta(minutes=CYCLE_SCHEDULE_LAST_CYCLE_MINUTES_BEFORE_CLOSE)
+            if is_last_hour
+            else hour_mark + timedelta(minutes=CYCLE_SCHEDULE_MINUTE_AFTER_HOUR)
+        )
+        if market_open <= candidate < market_close:
+            times.append(candidate)
+        hour_mark += timedelta(hours=1)
+    return times
+
+
+def _latest_due_cycle_time(now_et: datetime, schedule: list[datetime]) -> datetime | None:
+    due = [scheduled for scheduled in schedule if scheduled <= now_et]
+    return max(due) if due else None
 
 
 def _build_activation_client(core: DeviceCore) -> ActivationClient:
@@ -151,7 +204,8 @@ def _record_snapshots(core: DeviceCore, alpaca: AlpacaClient) -> None:
       - account_snapshot: feeds draco's circuit breaker (equity_history)
         and display's portfolio candlestick view.
       - position_snapshot: one row per currently-held symbol, feeds
-        display's last-trade P&L and top-movers stock candlestick view.
+        display's last-trade P&L. No longer feeds a stock chart - see
+        stock_bar_sync.py for the real Alpaca-bars cache that replaced it.
       - bot_value_snapshot: one row per active bot that (a) has rebalanced
         at least once, so a target_weights allocation exists, and (b) has
         at least one target symbol currently held and priced. Deliberately
@@ -160,8 +214,10 @@ def _record_snapshots(core: DeviceCore, alpaca: AlpacaClient) -> None:
         currently-held position, not scoped to this bot at all - see
         loop.py's `_run_one_bot`) - using the latter would make every
         bot's value converge to ~the whole account's equity, which isn't a
-        per-bot signal at all. See device_core.db.models.BotValueSnapshot's
-        docstring for exactly what this index means and its one known gap.
+        per-bot signal at all. No longer rendered as a chart (display's
+        per-bot screen dropped its candlestick), kept for its own possible
+        future use. See device_core.db.models.BotValueSnapshot's docstring
+        for exactly what this index means and its one known gap.
 
     Called on its own fast cadence by main()'s loop, separate from
     run_cycle()'s own account_snapshot write (which still happens too, at
@@ -265,7 +321,8 @@ def _run_trading_loop(core: DeviceCore, activation: ActivationClient) -> None:
     pairing without a service restart.
     """
     last_snapshot_at = 0.0
-    last_cycle_at = 0.0
+    last_stock_bar_sync_at = 0.0
+    last_cycle_at: datetime | None = None
 
     while True:
         status = activation.check_status()
@@ -280,6 +337,7 @@ def _run_trading_loop(core: DeviceCore, activation: ActivationClient) -> None:
             continue
 
         now = time.monotonic()
+        now_et = datetime.now(MARKET_TIMEZONE)
 
         if now - last_snapshot_at >= ACCOUNT_SNAPSHOT_INTERVAL_SECONDS:
             try:
@@ -288,13 +346,21 @@ def _run_trading_loop(core: DeviceCore, activation: ActivationClient) -> None:
                 logger.exception("account snapshot poll failed")
             last_snapshot_at = now
 
+        if now - last_stock_bar_sync_at >= STOCK_BAR_SYNC_INTERVAL_SECONDS:
+            try:
+                sync_stock_bars(core, alpaca)
+            except Exception:
+                logger.exception("stock bar sync failed")
+            last_stock_bar_sync_at = now
+
         try:
             sync_bot_selections(core)
         except Exception:
             logger.exception("bot selection sync failed")
 
         market_open = market_data_provider.is_market_open()
-        cycle_due = now - last_cycle_at >= TRADING_CYCLE_INTERVAL_SECONDS
+        due_time = _latest_due_cycle_time(now_et, scheduled_cycle_times_et(now_et.date()))
+        cycle_due = due_time is not None and (last_cycle_at is None or due_time > last_cycle_at)
         run_requested = check_run_requested(core)
 
         if run_requested and not market_open:
@@ -320,7 +386,7 @@ def _run_trading_loop(core: DeviceCore, activation: ActivationClient) -> None:
                 core.events.publish(EventType.FATAL_ERROR, {"component": "trading_worker"}, severity="error")
             if run_requested:
                 ack_run_request(core)
-            last_cycle_at = now
+            last_cycle_at = now_et
 
         time.sleep(ACCOUNT_SNAPSHOT_INTERVAL_SECONDS)
 
