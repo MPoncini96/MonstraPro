@@ -13,11 +13,15 @@ def _patch_bars(monkeypatch, frame):
 
 
 def test_run_aptet_selects_holdings_from_strong_uptrend_universe(monkeypatch):
+    # Three positive-momentum names (not just two) since aptet now enforces
+    # ABSOLUTE_MIN_HOLDINGS=3 -- a universe with only two good candidates
+    # would be forced to also hold one of the losers to hit the floor.
     n = 150
     frame = make_bars_frame(
         {
             "UP1": geometric_series(100.0, 0.006, n),
             "UP2": geometric_series(100.0, 0.005, n),
+            "UP3": geometric_series(100.0, 0.0045, n),
             "DOWN1": geometric_series(100.0, -0.004, n),
             "DOWN2": geometric_series(100.0, -0.006, n),
             "VOO": geometric_series(100.0, 0.000, n),
@@ -27,11 +31,11 @@ def test_run_aptet_selects_holdings_from_strong_uptrend_universe(monkeypatch):
 
     config = {
         "bot_id": "test-aptet",
-        "universe": ["UP1", "UP2", "DOWN1", "DOWN2"],
+        "universe": ["UP1", "UP2", "UP3", "DOWN1", "DOWN2"],
         "fallback_ticker": "VOO",
         "benchmark_ticker": "VOO",
-        "min_holdings": 1,
-        "max_holdings": 2,
+        "min_holdings": 3,
+        "max_holdings": 3,
         "adaptation_speed": "aggressive",
     }
     result = run_aptet(config)
@@ -42,7 +46,7 @@ def test_run_aptet_selects_holdings_from_strong_uptrend_universe(monkeypatch):
     assert result["payload"]["riskOff"] is False
 
     weights = result["payload"]["target_weights"]
-    assert set(weights.keys()).issubset({"UP1", "UP2"})
+    assert set(weights.keys()).issubset({"UP1", "UP2", "UP3"})
     assert sum(weights.values()) == pytest.approx(1.0)
 
 
